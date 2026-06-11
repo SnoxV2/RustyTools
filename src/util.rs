@@ -48,6 +48,27 @@ pub fn ensure_log_dir(base: &str, sub: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Deletes every file in `<base>/<sub>` (subfolders untouched).
+/// Returns the number of deleted files; a missing folder counts as 0.
+pub fn clear_log_files(base: &str, sub: &str) -> Result<usize, String> {
+    let dir = PathBuf::from(if base.trim().is_empty() { "logs" } else { base.trim() }).join(sub);
+    let entries = match std::fs::read_dir(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(format!("cannot read {}: {e}", dir.display())),
+        Ok(entries) => entries,
+    };
+    let mut deleted = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("cannot delete {}: {e}", path.display()))?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
 /// Builds a system command without spawning a console window on Windows.
 pub fn os_command(prog: &str) -> Command {
     #[allow(unused_mut)]

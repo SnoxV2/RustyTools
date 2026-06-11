@@ -3,6 +3,8 @@
 use eframe::egui;
 
 mod app;
+mod arp;
+mod dns;
 #[cfg(unix)]
 mod icmp;
 mod netconfig;
