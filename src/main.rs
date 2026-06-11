@@ -3,6 +3,8 @@
 use eframe::egui;
 
 mod app;
+#[cfg(unix)]
+mod icmp;
 mod netconfig;
 mod ping;
 mod settings;
