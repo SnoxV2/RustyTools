@@ -18,7 +18,7 @@ directories = "6"
 dns-lookup = "2"
 
 [target.'cfg(unix)'.dependencies]
-ping = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 
 [target.'cfg(windows)'.dependencies]
 winping = "0.10"

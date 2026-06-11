@@ -163,25 +163,15 @@ pub(crate) enum PingErr {
     Other(String),
 }
 
-fn looks_like_timeout(msg: &str, elapsed: Duration, timeout: Duration) -> bool {
-    let m = msg.to_lowercase();
-    m.contains("timeout")
-        || m.contains("timed out")
-        || m.contains("temporarily unavailable")
-        || m.contains("would block")
-        || elapsed >= timeout.mul_f64(0.95)
-}
-
 #[cfg(unix)]
 pub(crate) struct Backend {
-    use_raw: bool,
-    ident: u16,
+    pinger: Option<(IpAddr, crate::icmp::Pinger)>,
 }
 
 #[cfg(unix)]
 impl Backend {
     pub(crate) fn new() -> Self {
-        Backend { use_raw: false, ident: (std::process::id() & 0xffff) as u16 }
+        Backend { pinger: None }
     }
 
     pub(crate) fn ping(
@@ -190,41 +180,26 @@ impl Backend {
         timeout: Duration,
         seq: u16,
     ) -> Result<Duration, PingErr> {
-        let started = Instant::now();
-        let result = if self.use_raw {
-            ping::rawsock::ping(ip, Some(timeout), Some(64), Some(self.ident), Some(seq), None)
-        } else {
-            ping::dgramsock::ping(ip, Some(timeout), Some(64), Some(self.ident), Some(seq), None)
-        };
-        match result {
-            Ok(()) => Ok(started.elapsed()),
-            Err(e) => {
-                let msg = e.to_string();
-                let permission = {
-                    let m = msg.to_lowercase();
-                    m.contains("permission") || m.contains("not permitted")
-                };
-                if permission && !self.use_raw {
-                    // Unprivileged ICMP socket unavailable (ping_group_range on
-                    // Linux): retry with a raw socket.
-                    self.use_raw = true;
-                    return self.ping(ip, timeout, seq);
-                }
-                if permission {
-                    return Err(PingErr::Other(
-                        "insufficient permissions to open an ICMP socket — run as root/sudo, \
-                         or on Linux: sysctl -w net.ipv4.ping_group_range='0 65535'"
-                            .to_string(),
-                    ));
-                }
-                if looks_like_timeout(&msg, started.elapsed(), timeout) {
-                    Err(PingErr::Timeout)
-                } else {
-                    Err(PingErr::Other(msg))
-                }
-            }
+        if self.pinger.as_ref().is_none_or(|(cached, _)| *cached != ip) {
+            let pinger = crate::icmp::Pinger::new(ip).map_err(PingErr::Other)?;
+            self.pinger = Some((ip, pinger));
+        }
+        match self.pinger.as_ref().unwrap().1.ping(seq, timeout) {
+            Ok(rtt) => Ok(rtt),
+            Err(crate::icmp::PingError::Timeout) => Err(PingErr::Timeout),
+            Err(crate::icmp::PingError::Other(msg)) => Err(PingErr::Other(msg)),
         }
     }
+}
+
+#[cfg(windows)]
+fn looks_like_timeout(msg: &str, elapsed: Duration, timeout: Duration) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("timeout")
+        || m.contains("timed out")
+        || m.contains("temporarily unavailable")
+        || m.contains("would block")
+        || elapsed >= timeout.mul_f64(0.95)
 }
 
 #[cfg(windows)]
