@@ -41,7 +41,7 @@ impl PingSession {
     }
 }
 
-/// Démarre une session de ping continu : un thread par cible, un fichier de log par cible.
+/// Starts a continuous ping session: one thread and one log file per target.
 pub fn start(
     targets: Vec<String>,
     interval: Duration,
@@ -49,8 +49,8 @@ pub fn start(
     log_dir: &str,
     tx: Sender<Event>,
 ) -> Result<PingSession, String> {
-    let dir = util::ensure_log_dir(log_dir)
-        .map_err(|e| format!("création du répertoire de logs impossible : {e}"))?;
+    let dir = util::ensure_log_dir(log_dir, "ping")
+        .map_err(|e| format!("failed to create log directory: {e}"))?;
     let stamp = util::now_file_str();
     let stop = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
@@ -59,8 +59,8 @@ pub fn start(
     for target in targets {
         let path = dir.join(format!("ping_{stamp}_{}.csv", util::sanitize_filename(&target)));
         let mut file = File::create(&path)
-            .map_err(|e| format!("création du fichier de log {} impossible : {e}", path.display()))?;
-        let _ = writeln!(file, "horodatage;cible;ip;seq;statut;rtt_ms;gigue_ms");
+            .map_err(|e| format!("failed to create log file {}: {e}", path.display()))?;
+        let _ = writeln!(file, "timestamp;target;ip;seq;status;rtt_ms;jitter_ms");
         log_files.push(path);
 
         let stop = stop.clone();
@@ -85,7 +85,7 @@ fn worker(
         Ok(ip) => ip,
         Err(e) => {
             let timestamp = util::now_str();
-            let _ = writeln!(file, "{timestamp};{target};;0;ERREUR: {};;", e.replace(';', ","));
+            let _ = writeln!(file, "{timestamp};{target};;0;ERROR: {};;", e.replace(';', ","));
             let _ = tx.send(Event::Ping(PingEvent {
                 target,
                 ip: None,
@@ -127,7 +127,7 @@ fn worker(
             ),
             PingStatus::Timeout => format!("{timestamp};{target};{ip};{seq};TIMEOUT;;"),
             PingStatus::Error(msg) => {
-                format!("{timestamp};{target};{ip};{seq};ERREUR: {};;", msg.replace(';', ","))
+                format!("{timestamp};{target};{ip};{seq};ERROR: {};;", msg.replace(';', ","))
             }
         };
         let _ = writeln!(file, "{log_line}");
@@ -141,13 +141,13 @@ fn worker(
             status,
             timestamp,
         }));
-        // Une erreur de socket (permissions, réseau hors service) se répéterait à
-        // l'identique : on arrête ce worker plutôt que de spammer le journal.
+        // A socket error (permissions, network down) would repeat identically:
+        // stop this worker instead of spamming the log.
         if fatal {
             return;
         }
 
-        // Attente jusqu'au prochain envoi, interruptible par Arrêter.
+        // Wait until the next probe, interruptible by Stop.
         loop {
             let elapsed = started.elapsed();
             if elapsed >= interval || stop.load(Ordering::SeqCst) {
@@ -158,7 +158,7 @@ fn worker(
     }
 }
 
-enum PingErr {
+pub(crate) enum PingErr {
     Timeout,
     Other(String),
 }
@@ -173,18 +173,23 @@ fn looks_like_timeout(msg: &str, elapsed: Duration, timeout: Duration) -> bool {
 }
 
 #[cfg(unix)]
-struct Backend {
+pub(crate) struct Backend {
     use_raw: bool,
     ident: u16,
 }
 
 #[cfg(unix)]
 impl Backend {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Backend { use_raw: false, ident: (std::process::id() & 0xffff) as u16 }
     }
 
-    fn ping(&mut self, ip: IpAddr, timeout: Duration, seq: u16) -> Result<Duration, PingErr> {
+    pub(crate) fn ping(
+        &mut self,
+        ip: IpAddr,
+        timeout: Duration,
+        seq: u16,
+    ) -> Result<Duration, PingErr> {
         let started = Instant::now();
         let result = if self.use_raw {
             ping::rawsock::ping(ip, Some(timeout), Some(64), Some(self.ident), Some(seq), None)
@@ -200,15 +205,15 @@ impl Backend {
                     m.contains("permission") || m.contains("not permitted")
                 };
                 if permission && !self.use_raw {
-                    // Socket ICMP non privilégié indisponible (ping_group_range sous
-                    // Linux) : on retente en socket brut.
+                    // Unprivileged ICMP socket unavailable (ping_group_range on
+                    // Linux): retry with a raw socket.
                     self.use_raw = true;
                     return self.ping(ip, timeout, seq);
                 }
                 if permission {
                     return Err(PingErr::Other(
-                        "permissions insuffisantes pour ouvrir un socket ICMP — relancez en \
-                         root/sudo, ou sous Linux : sysctl -w net.ipv4.ping_group_range='0 65535'"
+                        "insufficient permissions to open an ICMP socket — run as root/sudo, \
+                         or on Linux: sysctl -w net.ipv4.ping_group_range='0 65535'"
                             .to_string(),
                     ));
                 }
@@ -223,19 +228,24 @@ impl Backend {
 }
 
 #[cfg(windows)]
-struct Backend {
+pub(crate) struct Backend {
     pinger: Option<winping::Pinger>,
 }
 
 #[cfg(windows)]
 impl Backend {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Backend { pinger: winping::Pinger::new().ok() }
     }
 
-    fn ping(&mut self, ip: IpAddr, timeout: Duration, _seq: u16) -> Result<Duration, PingErr> {
+    pub(crate) fn ping(
+        &mut self,
+        ip: IpAddr,
+        timeout: Duration,
+        _seq: u16,
+    ) -> Result<Duration, PingErr> {
         let Some(pinger) = self.pinger.as_mut() else {
-            return Err(PingErr::Other("initialisation ICMP impossible (IcmpCreateFile)".into()));
+            return Err(PingErr::Other("ICMP initialization failed (IcmpCreateFile)".into()));
         };
         pinger.set_timeout(timeout.as_millis().max(1) as u32);
         let started = Instant::now();

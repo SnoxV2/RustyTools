@@ -1,71 +1,81 @@
-# RustyTools — Diagnostic réseau
+# RustyTools — Network Diagnostics
 
-Outil de diagnostic pour administrateurs réseau, système et sécurité. Application
-graphique native (egui), multiplateforme : **Windows, macOS, Linux**.
+Diagnostic tool for network, system and security administrators. Native GUI
+application (egui), cross-platform: **Windows, macOS, Linux**.
 
-## Fonctionnalités (v1)
+## Features
 
-### 📡 Ping continu
-- Ping simultané de plusieurs cibles (IP ou FQDN, une par ligne)
-- Intervalle et timeout configurables
-- Statistiques en direct : envoyés, reçus, perte (%), RTT dernier/min/moy/max, gigue
-- Un fichier de log CSV horodaté par cible :
-  `logs/ping_<date>_<cible>.csv` au format
-  `horodatage;cible;ip;seq;statut;rtt_ms;gigue_ms`
-  (statut : `OK`, `TIMEOUT` en cas de perte de paquet, ou `ERREUR: …`)
+### 📡 Continuous ping
+- Ping multiple targets simultaneously (IP or FQDN, one per line)
+- Configurable interval and timeout (typed fields, persisted)
+- **PingPlotter-style latency graph** as the main view, with one colored line
+  per target and red markers on packet loss
+- Live statistics: sent, received, loss (%), last/min/avg/max RTT, jitter
+- One timestamped CSV log file per target:
+  `logs/ping/ping_<date>_<target>.csv` with
+  `timestamp;target;ip;seq;status;rtt_ms;jitter_ms`
+  (status: `OK`, `TIMEOUT` on packet loss, or `ERROR: …`)
 
-La gigue est calculée comme la variation entre deux RTT consécutifs ; le tableau
-affiche la gigue moyenne de la session.
+Jitter is the variation between two consecutive RTTs; the table shows the
+session average.
 
-### 🛣 Traceroute
-- Plusieurs cibles en parallèle, sortie en direct
-- Option de résolution des noms des sauts
-- Mode « répéter en continu » avec intervalle entre passes
-- Un fichier de log horodaté par cible : `logs/traceroute_<date>_<cible>.log`
-- S'appuie sur l'outil système : `tracert` (Windows), `traceroute` (macOS/Linux),
-  avec repli sur `tracepath` sous Linux
+### 🛣 Traceroute (MTR-style)
+- **WinMTR / PingPlotter-style live view**: the path is discovered once with
+  the system traceroute, then every responding hop is probed continuously —
+  each hop row shows loss %, sent, last/avg/best/worst latency and jitter
+- Configurable hop limit (max hops), probe interval and probe timeout
+- Optional reverse DNS on hops
+- Multiple targets in parallel
+- Logs per target: `logs/traceroute/discovery_<date>_<target>.log` (raw path
+  discovery) and `logs/traceroute/mtr_<date>_<target>.csv` (every probe)
+- Path discovery uses the system tool: `tracert` (Windows), `traceroute`
+  (macOS/Linux), with a `tracepath` fallback on Linux
 
-### 🖧 Configuration réseau
-- Nom d'hôte, domaine, serveurs DNS
-- Interfaces : état (UP/DOWN), type, MAC, IPv4 + masque, IPv6, passerelle, DNS,
-  interface par défaut
-- Table de routage complète
-- Sorties brutes des outils système (`ipconfig /all`, `ifconfig`, `ip addr`, …)
-- Export du rapport complet en fichier texte
+### 🖧 Network configuration
+- Hostname, DNS domain, DNS servers
+- Interfaces: state (UP/DOWN), type, MAC, IPv4 + mask, IPv6, gateway, DNS,
+  default interface
+- Full routing table
+- Raw output of the system tools (`ipconfig /all`, `ifconfig`, `ip addr`, …)
+- Full report export to a text file in `logs/netconfig/`
 
-## Compilation
+### ⚙ Settings
+- Log folder, selected with the native folder picker
+- Settings (log folder, intervals, timeouts, hop limit, …) are saved
+  automatically in the platform config directory and persist across restarts
+- The `ping/`, `traceroute/` and `netconfig/` subfolders are created
+  automatically inside the log folder
 
-Prérequis : [Rust](https://rustup.rs) (édition 2021).
+## Building
+
+Requires [Rust](https://rustup.rs) (2021 edition).
 
 ```bash
 cargo build --release
 ```
 
-Le binaire se trouve dans `target/release/rustytools` (`rustytools.exe` sous
-Windows). Compiler sur (ou pour) chaque OS cible pour obtenir les trois
-exécutables.
+The binary is `target/release/rustytools` (`rustytools.exe` on Windows).
+Build on (or for) each target OS to get the three executables.
 
-Dépendances système sous Linux (exemple Debian/Ubuntu) pour l'interface
-graphique :
+System dependencies on Linux (Debian/Ubuntu example) for the GUI and dialogs:
 
 ```bash
 sudo apt install build-essential libgtk-3-dev libxcb-render0-dev \
   libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
 ```
 
-## Privilèges ICMP
+## ICMP privileges
 
-| OS | Comportement |
-|----|--------------|
-| Windows | Aucun privilège requis (API `IcmpSendEcho`) |
-| macOS | Aucun privilège requis (socket ICMP datagramme) |
-| Linux | Socket non privilégié si `net.ipv4.ping_group_range` l'autorise (cas général sur les distributions récentes) ; sinon repli automatique sur socket brut, qui nécessite root ou `setcap cap_net_raw+ep` |
+| OS | Behaviour |
+|----|-----------|
+| Windows | No privileges required (`IcmpSendEcho` API) |
+| macOS | No privileges required (ICMP datagram socket) |
+| Linux | Unprivileged socket when `net.ipv4.ping_group_range` allows it (the default on recent distributions); otherwise automatic fallback to a raw socket, which requires root or `setcap cap_net_raw+ep` |
 
-Si aucun des deux modes n'est disponible, l'erreur est affichée dans l'interface
-avec la marche à suivre.
+If neither mode is available, the error is shown in the UI with the fix.
 
 ## Logs
 
-Tous les fichiers sont écrits dans le répertoire configurable dans l'interface
-(`logs/` par défaut, créé automatiquement). Chaque ligne est horodatée à la
-milliseconde.
+All files are written under the log folder configured in Settings
+(`Documents/RustyTools/logs` by default), in the `ping/`, `traceroute/` and
+`netconfig/` subfolders. Every line is timestamped with millisecond precision.

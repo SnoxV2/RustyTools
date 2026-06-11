@@ -5,6 +5,7 @@ use eframe::egui;
 mod app;
 mod netconfig;
 mod ping;
+mod settings;
 mod traceroute;
 mod util;
 
@@ -16,7 +17,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "RustyTools — Diagnostic réseau",
+        "RustyTools — Network Diagnostics",
         options,
         Box::new(|cc| Ok(Box::new(app::RustyToolsApp::new(cc)))),
     )

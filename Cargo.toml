@@ -7,9 +7,15 @@ license = "MIT"
 
 [dependencies]
 eframe = "0.31"
+egui_plot = "0.31"
 chrono = "0.4"
 netdev = "0.31"
 gethostname = "0.5"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+dns-lookup = "2"
 
 [target.'cfg(unix)'.dependencies]
 ping = "0.5"
