@@ -46,6 +46,7 @@ pub fn start(
     targets: Vec<String>,
     interval: Duration,
     timeout: Duration,
+    source: crate::util::SourceConfig,
     log_dir: &str,
     tx: Sender<Event>,
 ) -> Result<PingSession, String> {
@@ -65,18 +66,21 @@ pub fn start(
 
         let stop = stop.clone();
         let tx = tx.clone();
+        let source = source.clone();
         handles.push(std::thread::spawn(move || {
-            worker(target, interval, timeout, file, stop, tx);
+            worker(target, interval, timeout, source, file, stop, tx);
         }));
     }
 
     Ok(PingSession { stop, handles, log_files })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker(
     target: String,
     interval: Duration,
     timeout: Duration,
+    source: crate::util::SourceConfig,
     mut file: File,
     stop: Arc<AtomicBool>,
     tx: Sender<Event>,
@@ -97,7 +101,7 @@ fn worker(
         }
     };
 
-    let mut backend = Backend::new();
+    let mut backend = Backend::new(source);
     let mut seq: u64 = 0;
     let mut prev_rtt: Option<Duration> = None;
 
@@ -165,13 +169,14 @@ pub(crate) enum PingErr {
 
 #[cfg(unix)]
 pub(crate) struct Backend {
+    source: crate::util::SourceConfig,
     pinger: Option<(IpAddr, crate::icmp::Pinger)>,
 }
 
 #[cfg(unix)]
 impl Backend {
-    pub(crate) fn new() -> Self {
-        Backend { pinger: None }
+    pub(crate) fn new(source: crate::util::SourceConfig) -> Self {
+        Backend { source, pinger: None }
     }
 
     pub(crate) fn ping(
@@ -181,7 +186,7 @@ impl Backend {
         seq: u16,
     ) -> Result<Duration, PingErr> {
         if self.pinger.as_ref().is_none_or(|(cached, _)| *cached != ip) {
-            let pinger = crate::icmp::Pinger::new(ip).map_err(PingErr::Other)?;
+            let pinger = crate::icmp::Pinger::new(ip, &self.source).map_err(PingErr::Other)?;
             self.pinger = Some((ip, pinger));
         }
         match self.pinger.as_ref().unwrap().1.ping(seq, timeout) {
@@ -204,13 +209,14 @@ fn looks_like_timeout(msg: &str, elapsed: Duration, timeout: Duration) -> bool {
 
 #[cfg(windows)]
 pub(crate) struct Backend {
+    source: crate::util::SourceConfig,
     pinger: Option<winping::Pinger>,
 }
 
 #[cfg(windows)]
 impl Backend {
-    pub(crate) fn new() -> Self {
-        Backend { pinger: winping::Pinger::new().ok() }
+    pub(crate) fn new(source: crate::util::SourceConfig) -> Self {
+        Backend { source, pinger: winping::Pinger::new().ok() }
     }
 
     pub(crate) fn ping(
@@ -223,9 +229,20 @@ impl Backend {
             return Err(PingErr::Other("ICMP initialization failed (IcmpCreateFile)".into()));
         };
         pinger.set_timeout(timeout.as_millis().max(1) as u32);
+        let bind_ip = self.source.bind_ip_for(&ip).map_err(PingErr::Other)?;
         let started = Instant::now();
         let mut buffer = winping::Buffer::new();
-        match pinger.send(ip, &mut buffer) {
+        // IcmpSendEcho2Ex (send*_from) handles the optional source address.
+        let result = match (bind_ip, ip) {
+            (Some(std::net::IpAddr::V4(src)), std::net::IpAddr::V4(dst)) => {
+                pinger.send4_from(src, dst, &mut buffer)
+            }
+            (Some(std::net::IpAddr::V6(src)), std::net::IpAddr::V6(dst)) => {
+                pinger.send6_from(src, dst, &mut buffer)
+            }
+            _ => pinger.send(ip, &mut buffer),
+        };
+        match result {
             Ok(rtt_ms) => Ok(Duration::from_millis(rtt_ms as u64)),
             Err(e) => {
                 let msg = e.to_string();

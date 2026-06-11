@@ -31,6 +31,32 @@ session average.
 - Path discovery uses the system tool: `tracert` (Windows), `traceroute`
   (macOS/Linux), with a `tracepath` fallback on Linux
 
+### Advanced source selection (Ping, Traceroute, DNS)
+Each of these tabs has an **Advanced** section to pick the probe source —
+default behavior (system routing) is unchanged unless you opt in:
+- **Source interface**: choose among the detected interfaces (refreshable
+  list); probes are bound to that interface's address (plus
+  `SO_BINDTODEVICE` on Linux / `IP_BOUND_IF` on macOS)
+- **Custom source IP**: bind probes to a specific local address
+- Traceroute passes `-s`/`-i` to the system tool on macOS/Linux; Windows
+  `tracert` has no source option so only the per-hop probing honors it
+- For DNS the source applies to the custom servers (not the system resolver)
+
+### 🌐 DNS lookup
+- Resolve names with the **system DNS** and/or a list of **custom DNS
+  servers** (8.8.8.8, 1.1.1.1, a local AD controller, …) and compare the
+  answers side by side
+- Record types: A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, PTR — entering an IP
+  automatically performs a reverse (PTR) lookup
+- Per-query timing, one timestamped log file per run in `logs/dns/`
+
+### 📇 ARP
+- Lists the devices in the host ARP/neighbor table (`arp`/`ip neigh`):
+  IP, MAC, interface, state
+- **Vendor identification on demand** from the embedded IEEE OUI database
+  (offline, no API rate limits)
+- Table export (with vendors) to `logs/arp/`
+
 ### 🖧 Network configuration
 - Hostname, DNS domain, DNS servers
 - Interfaces: state (UP/DOWN), type, MAC, IPv4 + mask, IPv6, gateway, DNS,
@@ -43,8 +69,11 @@ session average.
 - Log folder, selected with the native folder picker
 - Settings (log folder, intervals, timeouts, hop limit, …) are saved
   automatically in the platform config directory and persist across restarts
-- The `ping/`, `traceroute/` and `netconfig/` subfolders are created
-  automatically inside the log folder
+- The `ping/`, `traceroute/`, `dns/`, `arp/` and `netconfig/` subfolders are
+  created automatically inside the log folder
+- Every feature page has a **Delete log files** button (with confirmation)
+  that empties its own log subfolder, plus a **Clear results** button for
+  the current view
 
 ## Building
 
@@ -77,5 +106,6 @@ If neither mode is available, the error is shown in the UI with the fix.
 ## Logs
 
 All files are written under the log folder configured in Settings
-(`Documents/RustyTools/logs` by default), in the `ping/`, `traceroute/` and
-`netconfig/` subfolders. Every line is timestamped with millisecond precision.
+(`Documents/RustyTools/logs` by default), in the `ping/`, `traceroute/`,
+`dns/`, `arp/` and `netconfig/` subfolders. Every line is timestamped with
+millisecond precision.

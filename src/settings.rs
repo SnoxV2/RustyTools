@@ -14,6 +14,9 @@ pub struct AppConfig {
     pub trace_interval_s: f32,
     pub trace_timeout_s: f32,
     pub trace_resolve_names: bool,
+    pub dns_use_system: bool,
+    pub dns_custom_servers: String,
+    pub dns_record_type: String,
 }
 
 impl Default for AppConfig {
@@ -26,6 +29,9 @@ impl Default for AppConfig {
             trace_interval_s: 1.0,
             trace_timeout_s: 1.0,
             trace_resolve_names: false,
+            dns_use_system: true,
+            dns_custom_servers: "8.8.8.8\n1.1.1.1".to_string(),
+            dns_record_type: "A".to_string(),
         }
     }
 }

@@ -71,6 +71,7 @@ pub struct TraceParams {
     pub probe_interval: Duration,
     pub probe_timeout: Duration,
     pub resolve_names: bool,
+    pub source: crate::util::SourceConfig,
 }
 
 /// Starts one MTR-style monitoring thread per target.
@@ -146,10 +147,15 @@ fn target_worker(
     };
 
     status(format!("discovering path (max {} hops)…", params.max_hops));
+    if !params.source.is_default() {
+        if let Some(note) = discovery_source_note() {
+            status(note.to_string());
+        }
+    }
 
     // --- Path discovery via the system traceroute, numeric output only ---
     let mut hops: BTreeMap<u8, Option<IpAddr>> = BTreeMap::new();
-    match spawn_traceroute(&target_ip.to_string(), params.max_hops) {
+    match spawn_traceroute(&target_ip.to_string(), params.max_hops, &params.source) {
         Err(e) => {
             status(e);
             return;
@@ -229,9 +235,10 @@ fn target_worker(
         let target = target.clone();
         let interval = params.probe_interval;
         let timeout = params.probe_timeout;
+        let source = params.source.clone();
         let hop = info.hop;
         hop_handles.push(std::thread::spawn(move || {
-            hop_worker(target, hop, ip, interval, timeout, csv, stop, tx);
+            hop_worker(target, hop, ip, interval, timeout, source, csv, stop, tx);
         }));
     }
     for handle in hop_handles {
@@ -247,11 +254,12 @@ fn hop_worker(
     ip: IpAddr,
     interval: Duration,
     timeout: Duration,
+    source: crate::util::SourceConfig,
     csv: Arc<Mutex<File>>,
     stop: Arc<AtomicBool>,
     tx: Sender<Event>,
 ) {
-    let mut backend = Backend::new();
+    let mut backend = Backend::new(source);
     let mut seq: u64 = 0;
 
     while !stop.load(Ordering::SeqCst) {
@@ -335,8 +343,25 @@ fn parse_hop_line(line: &str) -> Option<(u8, Option<IpAddr>)> {
     Some((hop, None))
 }
 
-fn spawn_traceroute(target: &str, max_hops: u8) -> Result<Child, String> {
-    let candidates = traceroute_commands(target, max_hops);
+/// Platform note when the discovery tool cannot honor the source selection
+/// (hop probing always honors it through our own ICMP sockets).
+fn discovery_source_note() -> Option<&'static str> {
+    #[cfg(windows)]
+    {
+        Some("note: tracert does not support source selection — discovery uses the default route; hop probing honors the source")
+    }
+    #[cfg(unix)]
+    {
+        None
+    }
+}
+
+fn spawn_traceroute(
+    target: &str,
+    max_hops: u8,
+    source: &crate::util::SourceConfig,
+) -> Result<Child, String> {
+    let candidates = traceroute_commands(target, max_hops, source);
     let mut last_err = String::new();
     for (prog, args) in &candidates {
         let mut cmd = util::os_command(prog);
@@ -360,7 +385,12 @@ fn set_locale_c(cmd: &mut Command) {
 }
 
 #[cfg(windows)]
-fn traceroute_commands(target: &str, max_hops: u8) -> Vec<(String, Vec<String>)> {
+fn traceroute_commands(
+    target: &str,
+    max_hops: u8,
+    _source: &crate::util::SourceConfig,
+) -> Vec<(String, Vec<String>)> {
+    // tracert has no IPv4 source option; hop probing still honors the source.
     vec![(
         "tracert".to_string(),
         vec![
@@ -375,20 +405,29 @@ fn traceroute_commands(target: &str, max_hops: u8) -> Vec<(String, Vec<String>)>
 }
 
 #[cfg(unix)]
-fn traceroute_commands(target: &str, max_hops: u8) -> Vec<(String, Vec<String>)> {
+fn traceroute_commands(
+    target: &str,
+    max_hops: u8,
+    source: &crate::util::SourceConfig,
+) -> Vec<(String, Vec<String>)> {
+    let mut traceroute_args = vec![
+        "-n".to_string(),
+        "-m".to_string(),
+        max_hops.to_string(),
+        "-w".to_string(),
+        "2".to_string(),
+    ];
+    if let Some(ip) = source.ip {
+        traceroute_args.extend(["-s".to_string(), ip.to_string()]);
+    }
+    if let Some(iface) = &source.iface {
+        traceroute_args.extend(["-i".to_string(), iface.name.clone()]);
+    }
+    traceroute_args.push(target.to_string());
     vec![
-        (
-            "traceroute".to_string(),
-            vec![
-                "-n".to_string(),
-                "-m".to_string(),
-                max_hops.to_string(),
-                "-w".to_string(),
-                "2".to_string(),
-                target.to_string(),
-            ],
-        ),
-        // tracepath is the fallback on Linux when traceroute is not installed.
+        ("traceroute".to_string(), traceroute_args),
+        // tracepath is the fallback on Linux when traceroute is not
+        // installed (no source options; hop probing still honors them).
         (
             "tracepath".to_string(),
             vec!["-n".to_string(), "-m".to_string(), max_hops.to_string(), target.to_string()],

@@ -1,12 +1,14 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui_plot::{Legend, Line, MarkerShape, Plot, PlotPoints, Points};
 
+use crate::arp::{self, ArpEntry, ArpEvent};
+use crate::dns::{self, DnsAnswer, DnsEvent};
 use crate::netconfig::{self, NetReport};
 use crate::ping::{self, PingSession, PingStatus};
 use crate::settings::{self, AppConfig};
@@ -15,12 +17,16 @@ use crate::traceroute::{self, HopInfo, ProbeStatus, TraceParams, TraceSession};
 pub enum Event {
     Ping(ping::PingEvent),
     Trace(traceroute::TraceEvent),
+    Dns(DnsEvent),
+    Arp(ArpEvent),
 }
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
     Ping,
     Traceroute,
+    Dns,
+    Arp,
     NetConfig,
     Settings,
 }
@@ -37,6 +43,102 @@ const PALETTE: [egui::Color32; 10] = [
     egui::Color32::from_rgb(0x90, 0xa4, 0xae),
     egui::Color32::from_rgb(0xf0, 0x62, 0x92),
 ];
+
+#[derive(PartialEq, Clone, Copy)]
+enum SourceSel {
+    Default,
+    Iface(usize),
+    CustomIp,
+}
+
+/// "Advanced > Source" selector state (one per feature tab).
+struct SourceUi {
+    sel: SourceSel,
+    custom_ip: String,
+}
+
+impl Default for SourceUi {
+    fn default() -> Self {
+        SourceUi { sel: SourceSel::Default, custom_ip: String::new() }
+    }
+}
+
+struct IfaceChoice {
+    label: String,
+    source: util::IfaceSource,
+}
+
+fn gather_ifaces() -> Vec<IfaceChoice> {
+    let mut out = Vec::new();
+    for itf in netdev::get_interfaces() {
+        let mut addrs: Vec<IpAddr> = itf.ipv4.iter().map(|n| IpAddr::V4(n.addr())).collect();
+        addrs.extend(itf.ipv6.iter().map(|n| IpAddr::V6(n.addr())));
+        if addrs.is_empty() {
+            continue;
+        }
+        let display = addrs.iter().find(|a| a.is_ipv4()).unwrap_or(&addrs[0]);
+        out.push(IfaceChoice {
+            label: format!("{} ({display})", itf.name),
+            source: util::IfaceSource { name: itf.name.clone(), index: itf.index, addrs },
+        });
+    }
+    out.sort_by(|a, b| a.label.cmp(&b.label));
+    out
+}
+
+/// Draws the source selector; default keeps the OS routing behavior.
+fn source_selector(ui: &mut egui::Ui, id: &str, src: &mut SourceUi, ifaces: &[IfaceChoice]) {
+    ui.horizontal(|ui| {
+        ui.label("Source:");
+        let selected = match src.sel {
+            SourceSel::Default => "Default (system routing)".to_string(),
+            SourceSel::Iface(i) => {
+                ifaces.get(i).map(|c| c.label.clone()).unwrap_or_else(|| "?".to_string())
+            }
+            SourceSel::CustomIp => "Custom IP…".to_string(),
+        };
+        egui::ComboBox::from_id_salt(id.to_string()).selected_text(selected).show_ui(ui, |ui| {
+            ui.selectable_value(&mut src.sel, SourceSel::Default, "Default (system routing)");
+            for (i, choice) in ifaces.iter().enumerate() {
+                ui.selectable_value(&mut src.sel, SourceSel::Iface(i), &choice.label);
+            }
+            ui.selectable_value(&mut src.sel, SourceSel::CustomIp, "Custom IP…");
+        });
+    });
+    if src.sel == SourceSel::CustomIp {
+        ui.horizontal(|ui| {
+            ui.label("Source IP:");
+            ui.add(
+                egui::TextEdit::singleline(&mut src.custom_ip)
+                    .desired_width(160.0)
+                    .hint_text("192.168.1.10"),
+            );
+        });
+    }
+}
+
+/// Converts the selector state into the engine-side source config.
+fn source_config(src: &SourceUi, ifaces: &[IfaceChoice]) -> Result<util::SourceConfig, String> {
+    match src.sel {
+        SourceSel::Default => Ok(util::SourceConfig::default()),
+        SourceSel::Iface(i) => Ok(util::SourceConfig {
+            ip: None,
+            iface: Some(
+                ifaces
+                    .get(i)
+                    .ok_or("the interface list changed — reselect the source interface")?
+                    .source
+                    .clone(),
+            ),
+        }),
+        SourceSel::CustomIp => {
+            let text = src.custom_ip.trim();
+            let ip =
+                text.parse::<IpAddr>().map_err(|_| format!("invalid source IP: {text:?}"))?;
+            Ok(util::SourceConfig { ip: Some(ip), iface: None })
+        }
+    }
+}
 
 #[derive(Default)]
 struct Stats {
@@ -136,9 +238,33 @@ pub struct RustyToolsApp {
     trace_targets_state: Vec<TraceTargetState>,
     trace_error: Option<String>,
 
+    // DNS
+    dns_targets_text: String,
+    dns_results: Vec<DnsAnswer>,
+    dns_running: bool,
+    dns_error: Option<String>,
+    dns_log_file: Option<PathBuf>,
+
+    // ARP
+    arp_entries: Vec<ArpEntry>,
+    arp_raw: String,
+    arp_vendors: HashMap<String, String>,
+    arp_vendor_running: bool,
+    arp_message: Option<String>,
+
     // Network configuration
     net_report: Option<NetReport>,
     net_message: Option<String>,
+
+    // Log deletion (two-step confirmation), shared by all tabs
+    delete_confirm: Option<&'static str>,
+    logs_message: Option<String>,
+
+    // Advanced source selection (per feature) + detected interfaces
+    ifaces: Vec<IfaceChoice>,
+    ping_source: SourceUi,
+    trace_source: SourceUi,
+    dns_source: SourceUi,
 }
 
 impl RustyToolsApp {
@@ -161,9 +287,52 @@ impl RustyToolsApp {
             trace_session: None,
             trace_targets_state: Vec::new(),
             trace_error: None,
+            dns_targets_text: String::new(),
+            dns_results: Vec::new(),
+            dns_running: false,
+            dns_error: None,
+            dns_log_file: None,
+            arp_entries: Vec::new(),
+            arp_raw: String::new(),
+            arp_vendors: HashMap::new(),
+            arp_vendor_running: false,
+            arp_message: None,
             net_report: None,
             net_message: None,
+            delete_confirm: None,
+            logs_message: None,
+            ifaces: gather_ifaces(),
+            ping_source: SourceUi::default(),
+            trace_source: SourceUi::default(),
+            dns_source: SourceUi::default(),
         }
+    }
+
+    /// "Advanced" section shared by the feature tabs (source selection).
+    fn advanced_source_ui(&mut self, ui: &mut egui::Ui, id: &str, which: Tab, enabled: bool) {
+        egui::CollapsingHeader::new("Advanced").id_salt(format!("{id}_adv")).show(ui, |ui| {
+            ui.add_enabled_ui(enabled, |ui| {
+                let src = match which {
+                    Tab::Ping => &mut self.ping_source,
+                    Tab::Traceroute => &mut self.trace_source,
+                    _ => &mut self.dns_source,
+                };
+                source_selector(ui, id, src, &self.ifaces);
+                if which == Tab::Dns {
+                    ui.weak("Applies to custom DNS servers only.");
+                }
+                if ui.small_button("🔄 Refresh interface list").clicked() {
+                    self.ifaces = gather_ifaces();
+                    for src in
+                        [&mut self.ping_source, &mut self.trace_source, &mut self.dns_source]
+                    {
+                        if matches!(src.sel, SourceSel::Iface(i) if i >= self.ifaces.len()) {
+                            src.sel = SourceSel::Default;
+                        }
+                    }
+                }
+            });
+        });
     }
 
     fn drain_events(&mut self) {
@@ -171,6 +340,13 @@ impl RustyToolsApp {
             match event {
                 Event::Ping(ev) => self.on_ping_event(ev),
                 Event::Trace(ev) => self.on_trace_event(ev),
+                Event::Dns(DnsEvent::Answer(answer)) => self.dns_results.push(answer),
+                Event::Dns(DnsEvent::Done) => self.dns_running = false,
+                Event::Arp(ArpEvent::Vendor { oui, vendor }) => {
+                    self.arp_vendors.insert(oui, vendor);
+                }
+                Event::Arp(ArpEvent::Error(msg)) => self.arp_message = Some(msg),
+                Event::Arp(ArpEvent::Done) => self.arp_vendor_running = false,
             }
         }
     }
@@ -283,6 +459,39 @@ impl RustyToolsApp {
         }
     }
 
+    /// "Delete log files" button with a two-step inline confirmation.
+    /// Deletes every file in the tab's log subfolder.
+    fn delete_logs_ui(&mut self, ui: &mut egui::Ui, sub: &'static str, enabled: bool) {
+        ui.horizontal(|ui| {
+            if self.delete_confirm == Some(sub) {
+                ui.colored_label(egui::Color32::LIGHT_RED, format!("Delete all files in {sub}/?"));
+                if ui.button("Yes, delete").clicked() {
+                    self.logs_message =
+                        Some(match util::clear_log_files(&self.config.log_dir, sub) {
+                            Ok(n) => format!("{n} log file(s) deleted."),
+                            Err(e) => e,
+                        });
+                    self.delete_confirm = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.delete_confirm = None;
+                }
+            } else if ui
+                .add_enabled(enabled, egui::Button::new("🗑 Delete log files"))
+                .on_disabled_hover_text("Stop the running session first")
+                .clicked()
+            {
+                self.delete_confirm = Some(sub);
+                self.logs_message = None;
+            }
+        });
+        if self.delete_confirm.is_none() {
+            if let Some(msg) = &self.logs_message {
+                ui.weak(msg.clone());
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- Ping
 
     fn start_ping(&mut self) {
@@ -302,10 +511,18 @@ impl RustyToolsApp {
             })
             .collect();
         self.ping_log.clear();
+        let source = match source_config(&self.ping_source, &self.ifaces) {
+            Ok(s) => s,
+            Err(e) => {
+                self.ping_error = Some(e);
+                return;
+            }
+        };
         match ping::start(
             targets,
             Duration::from_secs_f32(self.config.ping_interval_s.max(0.1)),
             Duration::from_secs_f32(self.config.ping_timeout_s.max(0.1)),
+            source,
             &self.config.log_dir,
             self.tx.clone(),
         ) {
@@ -366,6 +583,7 @@ impl RustyToolsApp {
                 }
                 ui.end_row();
             });
+            self.advanced_source_ui(ui, "ping_source", Tab::Ping, !running);
             ui.add_space(10.0);
 
             if running {
@@ -388,6 +606,19 @@ impl RustyToolsApp {
                 ui.add_space(6.0);
                 ui.colored_label(egui::Color32::LIGHT_RED, err);
             }
+
+            ui.add_space(10.0);
+            if ui.button("🧹 Clear results").clicked() {
+                for state in &mut self.ping_targets_state {
+                    state.stats = Stats::default();
+                    state.samples.clear();
+                }
+                if !running {
+                    self.ping_targets_state.clear();
+                }
+                self.ping_log.clear();
+            }
+            self.delete_logs_ui(ui, "ping", !running);
 
             if let Some(session) = &self.ping_session {
                 ui.add_space(10.0);
@@ -526,11 +757,19 @@ impl RustyToolsApp {
                 hops: Vec::new(),
             })
             .collect();
+        let source = match source_config(&self.trace_source, &self.ifaces) {
+            Ok(s) => s,
+            Err(e) => {
+                self.trace_error = Some(e);
+                return;
+            }
+        };
         let params = TraceParams {
             max_hops: self.config.trace_max_hops.max(1),
             probe_interval: Duration::from_secs_f32(self.config.trace_interval_s.max(0.1)),
             probe_timeout: Duration::from_secs_f32(self.config.trace_timeout_s.max(0.1)),
             resolve_names: self.config.trace_resolve_names,
+            source,
         };
         match traceroute::start(targets, params, &self.config.log_dir, self.tx.clone()) {
             Ok(session) => self.trace_session = Some(session),
@@ -610,6 +849,7 @@ impl RustyToolsApp {
             {
                 self.config_dirty = true;
             }
+            self.advanced_source_ui(ui, "trace_source", Tab::Traceroute, !running);
             ui.add_space(10.0);
 
             if running {
@@ -632,6 +872,16 @@ impl RustyToolsApp {
                 ui.add_space(6.0);
                 ui.colored_label(egui::Color32::LIGHT_RED, err);
             }
+
+            ui.add_space(10.0);
+            if ui
+                .add_enabled(!running, egui::Button::new("🧹 Clear results"))
+                .on_disabled_hover_text("Stop the running session first")
+                .clicked()
+            {
+                self.trace_targets_state.clear();
+            }
+            self.delete_logs_ui(ui, "traceroute", !running);
 
             if let Some(session) = &self.trace_session {
                 ui.add_space(10.0);
@@ -711,6 +961,287 @@ impl RustyToolsApp {
         });
     }
 
+    // ----------------------------------------------------------------- DNS
+
+    fn start_dns(&mut self) {
+        self.dns_error = None;
+        let targets = parse_targets(&self.dns_targets_text);
+        let mut custom = Vec::new();
+        let mut bad = Vec::new();
+        for line in self.config.dns_custom_servers.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            match t.parse::<IpAddr>() {
+                Ok(ip) => custom.push(ip),
+                Err(_) => bad.push(t.to_string()),
+            }
+        }
+        if !bad.is_empty() {
+            self.dns_error = Some(format!("Invalid DNS server address: {}", bad.join(", ")));
+            return;
+        }
+        let source = match source_config(&self.dns_source, &self.ifaces) {
+            Ok(s) => s,
+            Err(e) => {
+                self.dns_error = Some(e);
+                return;
+            }
+        };
+        match dns::start(
+            targets,
+            self.config.dns_record_type.clone(),
+            self.config.dns_use_system,
+            custom,
+            source,
+            &self.config.log_dir,
+            self.tx.clone(),
+        ) {
+            Ok(path) => {
+                self.dns_log_file = Some(path);
+                self.dns_running = true;
+            }
+            Err(e) => self.dns_error = Some(e),
+        }
+    }
+
+    fn ui_dns(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("dns_side").default_width(290.0).show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.heading("DNS lookup");
+            ui.add_space(6.0);
+            ui.label("Names or IPs (one per line, IP = reverse lookup):");
+            ui.add_enabled(
+                !self.dns_running,
+                egui::TextEdit::multiline(&mut self.dns_targets_text)
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("google.com\nsrv-ad01.mydomain.local\n192.168.1.10"),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Record type:");
+                egui::ComboBox::from_id_salt("dns_rtype")
+                    .selected_text(&self.config.dns_record_type)
+                    .show_ui(ui, |ui| {
+                        for t in dns::RECORD_TYPES {
+                            if ui
+                                .selectable_value(
+                                    &mut self.config.dns_record_type,
+                                    t.to_string(),
+                                    t,
+                                )
+                                .changed()
+                            {
+                                self.config_dirty = true;
+                            }
+                        }
+                    });
+            });
+            if ui
+                .checkbox(&mut self.config.dns_use_system, "Use system DNS")
+                .changed()
+            {
+                self.config_dirty = true;
+            }
+            ui.label("Custom DNS servers (one per line):");
+            if ui
+                .add(
+                    egui::TextEdit::multiline(&mut self.config.dns_custom_servers)
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("8.8.8.8\n1.1.1.1\n192.168.1.5"),
+                )
+                .changed()
+            {
+                self.config_dirty = true;
+            }
+            self.advanced_source_ui(ui, "dns_source", Tab::Dns, !self.dns_running);
+            ui.add_space(10.0);
+
+            ui.add_enabled_ui(!self.dns_running, |ui| {
+                if ui
+                    .add_sized([ui.available_width(), 32.0], egui::Button::new("🔍 Resolve"))
+                    .clicked()
+                {
+                    self.start_dns();
+                }
+            });
+            if self.dns_running {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("resolving…");
+                });
+            }
+            if let Some(err) = &self.dns_error {
+                ui.add_space(6.0);
+                ui.colored_label(egui::Color32::LIGHT_RED, err);
+            }
+
+            ui.add_space(10.0);
+            if ui.button("🧹 Clear results").clicked() {
+                self.dns_results.clear();
+            }
+            self.delete_logs_ui(ui, "dns", !self.dns_running);
+
+            if let Some(path) = &self.dns_log_file {
+                ui.add_space(10.0);
+                ui.label("Log file:");
+                ui.monospace(path.display().to_string());
+            }
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(4.0);
+            if self.dns_results.is_empty() {
+                ui.label(
+                    "Run a lookup to compare answers from the system resolver and/or \
+                     custom DNS servers (public resolvers, local AD, …).",
+                );
+                return;
+            }
+            egui::ScrollArea::both().id_salt("dns_scroll").auto_shrink([false, false]).show(
+                ui,
+                |ui| {
+                    egui::Grid::new("dns_results").striped(true).min_col_width(60.0).show(
+                        ui,
+                        |ui| {
+                            for header in ["Time", "Query", "Type", "Server", "Duration", "Answer"]
+                            {
+                                ui.strong(header);
+                            }
+                            ui.end_row();
+                            for answer in &self.dns_results {
+                                ui.label(&answer.timestamp);
+                                ui.label(&answer.query);
+                                ui.label(&answer.rtype);
+                                ui.label(&answer.server);
+                                ui.label(format!("{:.1} ms", answer.duration_ms));
+                                match &answer.error {
+                                    Some(e) => {
+                                        ui.colored_label(egui::Color32::LIGHT_RED, e);
+                                    }
+                                    None => {
+                                        ui.label(answer.records.join("\n"));
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        },
+                    );
+                },
+            );
+        });
+    }
+
+    // ----------------------------------------------------------------- ARP
+
+    fn ui_arp(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.heading("ARP table");
+                if ui.button("🔄 Refresh").clicked() {
+                    let (entries, raw) = arp::gather();
+                    self.arp_entries = entries;
+                    self.arp_raw = raw;
+                    self.arp_message = None;
+                }
+                let unresolved: Vec<String> = self
+                    .arp_entries
+                    .iter()
+                    .filter_map(|e| arp::oui_of(&e.mac))
+                    .filter(|oui| !self.arp_vendors.contains_key(oui))
+                    .collect();
+                if ui
+                    .add_enabled(
+                        !self.arp_vendor_running && !unresolved.is_empty(),
+                        egui::Button::new("🏷 Resolve vendors"),
+                    )
+                    .on_hover_text("Identify manufacturers from the embedded IEEE OUI database")
+                    .clicked()
+                {
+                    self.arp_vendor_running = true;
+                    let macs: Vec<String> =
+                        self.arp_entries.iter().map(|e| e.mac.clone()).collect();
+                    arp::lookup_vendors(macs, self.tx.clone());
+                }
+                if self.arp_vendor_running {
+                    ui.spinner();
+                }
+                if ui
+                    .add_enabled(!self.arp_entries.is_empty(), egui::Button::new("💾 Export"))
+                    .clicked()
+                {
+                    self.arp_message = Some(
+                        match arp::export(
+                            &self.arp_entries,
+                            &self.arp_vendors,
+                            &self.arp_raw,
+                            &self.config.log_dir,
+                        ) {
+                            Ok(path) => format!("Exported: {}", path.display()),
+                            Err(e) => format!("Export failed: {e}"),
+                        },
+                    );
+                }
+            });
+            self.delete_logs_ui(ui, "arp", true);
+            if let Some(msg) = &self.arp_message {
+                ui.label(msg.clone());
+            }
+            ui.add_space(6.0);
+
+            if self.arp_entries.is_empty() {
+                ui.label(
+                    "Press Refresh to list the devices present in the ARP/neighbor table \
+                     of this host, then resolve MAC vendors on demand.",
+                );
+                return;
+            }
+            egui::ScrollArea::vertical().id_salt("arp_scroll").auto_shrink([false, false]).show(
+                ui,
+                |ui| {
+                    egui::Grid::new("arp_table").striped(true).min_col_width(80.0).show(
+                        ui,
+                        |ui| {
+                            for header in ["IP", "MAC", "Vendor", "Interface", "State"] {
+                                ui.strong(header);
+                            }
+                            ui.end_row();
+                            for entry in &self.arp_entries {
+                                ui.label(&entry.ip);
+                                ui.monospace(&entry.mac);
+                                match arp::oui_of(&entry.mac)
+                                    .and_then(|oui| self.arp_vendors.get(&oui))
+                                {
+                                    Some(vendor) => ui.label(vendor),
+                                    None if self.arp_vendor_running => ui.weak("…"),
+                                    None => ui.weak("—"),
+                                };
+                                ui.label(&entry.iface);
+                                ui.label(&entry.state);
+                                ui.end_row();
+                            }
+                        },
+                    );
+                    ui.add_space(8.0);
+                    egui::CollapsingHeader::new("Raw output").default_open(false).show(
+                        ui,
+                        |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.arp_raw.as_str())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        },
+                    );
+                },
+            );
+        });
+    }
+
     // ------------------------------------------------------- Network config
 
     fn ui_netconfig(&mut self, ctx: &egui::Context) {
@@ -736,6 +1267,7 @@ impl RustyToolsApp {
                     }
                 }
             });
+            self.delete_logs_ui(ui, "netconfig", true);
             if let Some(msg) = &self.net_message {
                 ui.label(msg.clone());
             }
@@ -911,6 +1443,8 @@ impl eframe::App for RustyToolsApp {
                 ui.separator();
                 ui.selectable_value(&mut self.tab, Tab::Ping, "📡 Ping");
                 ui.selectable_value(&mut self.tab, Tab::Traceroute, "🛣 Traceroute");
+                ui.selectable_value(&mut self.tab, Tab::Dns, "🌐 DNS");
+                ui.selectable_value(&mut self.tab, Tab::Arp, "📇 ARP");
                 ui.selectable_value(&mut self.tab, Tab::NetConfig, "🖧 Network config");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "⚙ Settings");
             });
@@ -920,6 +1454,8 @@ impl eframe::App for RustyToolsApp {
         match self.tab {
             Tab::Ping => self.ui_ping(ctx),
             Tab::Traceroute => self.ui_trace(ctx),
+            Tab::Dns => self.ui_dns(ctx),
+            Tab::Arp => self.ui_arp(ctx),
             Tab::NetConfig => self.ui_netconfig(ctx),
             Tab::Settings => self.ui_settings(ctx),
         }
@@ -929,7 +1465,11 @@ impl eframe::App for RustyToolsApp {
             self.config_dirty = false;
         }
 
-        if self.ping_session.is_some() || self.trace_session.is_some() {
+        if self.ping_session.is_some()
+            || self.trace_session.is_some()
+            || self.dns_running
+            || self.arp_vendor_running
+        {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
     }

@@ -40,7 +40,8 @@ pub struct Pinger {
 }
 
 impl Pinger {
-    pub fn new(ip: IpAddr) -> Result<Self, String> {
+    pub fn new(ip: IpAddr, source: &crate::util::SourceConfig) -> Result<Self, String> {
+        let bind_ip = source.bind_ip_for(&ip)?;
         let domain = if ip.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
         let proto = if ip.is_ipv4() { Protocol::ICMPV4 } else { Protocol::ICMPV6 };
 
@@ -63,6 +64,27 @@ impl Pinger {
                 }
             },
         };
+
+        // Optional interface pinning (best effort: the source-IP bind below
+        // already fixes the source addressing).
+        #[cfg(target_os = "linux")]
+        if let Some(iface) = &source.iface {
+            let _ = sock.bind_device(Some(iface.name.as_bytes()));
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(iface) = &source.iface {
+            if let Some(index) = std::num::NonZeroU32::new(iface.index) {
+                let _ = if ip.is_ipv4() {
+                    sock.bind_device_by_index_v4(Some(index))
+                } else {
+                    sock.bind_device_by_index_v6(Some(index))
+                };
+            }
+        }
+        if let Some(bind_ip) = bind_ip {
+            sock.bind(&SocketAddr::new(bind_ip, 0).into())
+                .map_err(|e| format!("cannot bind to source {bind_ip}: {e}"))?;
+        }
 
         // connect() pins the peer: the kernel drops packets from other sources.
         sock.connect(&SocketAddr::new(ip, 0).into())
@@ -223,18 +245,32 @@ fn checksum(data: &[u8]) -> u16 {
 mod tests {
     use super::*;
 
+    fn default_source() -> crate::util::SourceConfig {
+        crate::util::SourceConfig::default()
+    }
+
     #[test]
     fn localhost_replies() {
-        let pinger = Pinger::new("127.0.0.1".parse().unwrap()).unwrap();
+        let pinger = Pinger::new("127.0.0.1".parse().unwrap(), &default_source()).unwrap();
         let rtt = pinger.ping(1, Duration::from_secs(2)).expect("localhost must reply");
         assert!(rtt < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn localhost_replies_with_bound_source() {
+        let source = crate::util::SourceConfig {
+            ip: Some("127.0.0.1".parse().unwrap()),
+            iface: None,
+        };
+        let pinger = Pinger::new("127.0.0.1".parse().unwrap(), &source).unwrap();
+        pinger.ping(1, Duration::from_secs(2)).expect("bound localhost ping must reply");
     }
 
     #[test]
     fn dead_address_does_not_reply() {
         // 192.0.2.1 (TEST-NET-1, RFC 5737) must never answer: any Ok here
         // means we matched a packet that was not ours.
-        let pinger = Pinger::new("192.0.2.1".parse().unwrap()).unwrap();
+        let pinger = Pinger::new("192.0.2.1".parse().unwrap(), &default_source()).unwrap();
         let started = Instant::now();
         match pinger.ping(7, Duration::from_secs(2)) {
             Ok(_) => panic!("got a reply from TEST-NET-1: reply matching is broken"),
@@ -249,12 +285,12 @@ mod tests {
         // One responsive target and one dead target probed at the same time:
         // the dead one must stay dead even while replies are flowing in.
         let alive = std::thread::spawn(|| {
-            let pinger = Pinger::new("127.0.0.1".parse().unwrap()).unwrap();
+            let pinger = Pinger::new("127.0.0.1".parse().unwrap(), &default_source()).unwrap();
             for seq in 0..20 {
                 let _ = pinger.ping(seq, Duration::from_millis(200));
             }
         });
-        let pinger = Pinger::new("192.0.2.1".parse().unwrap()).unwrap();
+        let pinger = Pinger::new("192.0.2.1".parse().unwrap(), &default_source()).unwrap();
         for seq in 0..3 {
             assert!(
                 pinger.ping(seq, Duration::from_millis(700)).is_err(),

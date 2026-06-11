@@ -48,6 +48,77 @@ pub fn ensure_log_dir(base: &str, sub: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Optional probe source: a specific local IP and/or a network interface.
+/// Default (both None) keeps the OS routing behavior.
+#[derive(Clone, Default)]
+pub struct SourceConfig {
+    pub ip: Option<IpAddr>,
+    pub iface: Option<IfaceSource>,
+}
+
+#[derive(Clone)]
+pub struct IfaceSource {
+    pub name: String,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub index: u32,
+    pub addrs: Vec<IpAddr>,
+}
+
+impl SourceConfig {
+    pub fn is_default(&self) -> bool {
+        self.ip.is_none() && self.iface.is_none()
+    }
+
+    /// Local address to bind for a given target, enforcing family match.
+    pub fn bind_ip_for(&self, target: &IpAddr) -> Result<Option<IpAddr>, String> {
+        if let Some(ip) = self.ip {
+            if ip.is_ipv4() == target.is_ipv4() {
+                Ok(Some(ip))
+            } else {
+                Err(format!(
+                    "source IP {ip} and target {target} are not in the same address family"
+                ))
+            }
+        } else if let Some(iface) = &self.iface {
+            iface
+                .addrs
+                .iter()
+                .find(|a| a.is_ipv4() == target.is_ipv4())
+                .copied()
+                .map(Some)
+                .ok_or_else(|| {
+                    format!(
+                        "interface {} has no address in the same family as {target}",
+                        iface.name
+                    )
+                })
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Deletes every file in `<base>/<sub>` (subfolders untouched).
+/// Returns the number of deleted files; a missing folder counts as 0.
+pub fn clear_log_files(base: &str, sub: &str) -> Result<usize, String> {
+    let dir = PathBuf::from(if base.trim().is_empty() { "logs" } else { base.trim() }).join(sub);
+    let entries = match std::fs::read_dir(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(format!("cannot read {}: {e}", dir.display())),
+        Ok(entries) => entries,
+    };
+    let mut deleted = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("cannot delete {}: {e}", path.display()))?;
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
 /// Builds a system command without spawning a console window on Windows.
 pub fn os_command(prog: &str) -> Command {
     #[allow(unused_mut)]
