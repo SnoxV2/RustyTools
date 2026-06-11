@@ -1,0 +1,23 @@
+[package]
+name = "rustytools"
+version = "0.1.0"
+edition = "2021"
+description = "Outil de diagnostic réseau pour administrateurs (ping, traceroute, configuration réseau)"
+license = "MIT"
+
+[dependencies]
+eframe = "0.31"
+chrono = "0.4"
+netdev = "0.31"
+gethostname = "0.5"
+
+[target.'cfg(unix)'.dependencies]
+ping = "0.5"
+
+[target.'cfg(windows)'.dependencies]
+winping = "0.10"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
