@@ -44,6 +44,102 @@ const PALETTE: [egui::Color32; 10] = [
     egui::Color32::from_rgb(0xf0, 0x62, 0x92),
 ];
 
+#[derive(PartialEq, Clone, Copy)]
+enum SourceSel {
+    Default,
+    Iface(usize),
+    CustomIp,
+}
+
+/// "Advanced > Source" selector state (one per feature tab).
+struct SourceUi {
+    sel: SourceSel,
+    custom_ip: String,
+}
+
+impl Default for SourceUi {
+    fn default() -> Self {
+        SourceUi { sel: SourceSel::Default, custom_ip: String::new() }
+    }
+}
+
+struct IfaceChoice {
+    label: String,
+    source: util::IfaceSource,
+}
+
+fn gather_ifaces() -> Vec<IfaceChoice> {
+    let mut out = Vec::new();
+    for itf in netdev::get_interfaces() {
+        let mut addrs: Vec<IpAddr> = itf.ipv4.iter().map(|n| IpAddr::V4(n.addr())).collect();
+        addrs.extend(itf.ipv6.iter().map(|n| IpAddr::V6(n.addr())));
+        if addrs.is_empty() {
+            continue;
+        }
+        let display = addrs.iter().find(|a| a.is_ipv4()).unwrap_or(&addrs[0]);
+        out.push(IfaceChoice {
+            label: format!("{} ({display})", itf.name),
+            source: util::IfaceSource { name: itf.name.clone(), index: itf.index, addrs },
+        });
+    }
+    out.sort_by(|a, b| a.label.cmp(&b.label));
+    out
+}
+
+/// Draws the source selector; default keeps the OS routing behavior.
+fn source_selector(ui: &mut egui::Ui, id: &str, src: &mut SourceUi, ifaces: &[IfaceChoice]) {
+    ui.horizontal(|ui| {
+        ui.label("Source:");
+        let selected = match src.sel {
+            SourceSel::Default => "Default (system routing)".to_string(),
+            SourceSel::Iface(i) => {
+                ifaces.get(i).map(|c| c.label.clone()).unwrap_or_else(|| "?".to_string())
+            }
+            SourceSel::CustomIp => "Custom IP…".to_string(),
+        };
+        egui::ComboBox::from_id_salt(id.to_string()).selected_text(selected).show_ui(ui, |ui| {
+            ui.selectable_value(&mut src.sel, SourceSel::Default, "Default (system routing)");
+            for (i, choice) in ifaces.iter().enumerate() {
+                ui.selectable_value(&mut src.sel, SourceSel::Iface(i), &choice.label);
+            }
+            ui.selectable_value(&mut src.sel, SourceSel::CustomIp, "Custom IP…");
+        });
+    });
+    if src.sel == SourceSel::CustomIp {
+        ui.horizontal(|ui| {
+            ui.label("Source IP:");
+            ui.add(
+                egui::TextEdit::singleline(&mut src.custom_ip)
+                    .desired_width(160.0)
+                    .hint_text("192.168.1.10"),
+            );
+        });
+    }
+}
+
+/// Converts the selector state into the engine-side source config.
+fn source_config(src: &SourceUi, ifaces: &[IfaceChoice]) -> Result<util::SourceConfig, String> {
+    match src.sel {
+        SourceSel::Default => Ok(util::SourceConfig::default()),
+        SourceSel::Iface(i) => Ok(util::SourceConfig {
+            ip: None,
+            iface: Some(
+                ifaces
+                    .get(i)
+                    .ok_or("the interface list changed — reselect the source interface")?
+                    .source
+                    .clone(),
+            ),
+        }),
+        SourceSel::CustomIp => {
+            let text = src.custom_ip.trim();
+            let ip =
+                text.parse::<IpAddr>().map_err(|_| format!("invalid source IP: {text:?}"))?;
+            Ok(util::SourceConfig { ip: Some(ip), iface: None })
+        }
+    }
+}
+
 #[derive(Default)]
 struct Stats {
     sent: u64,
@@ -163,6 +259,12 @@ pub struct RustyToolsApp {
     // Log deletion (two-step confirmation), shared by all tabs
     delete_confirm: Option<&'static str>,
     logs_message: Option<String>,
+
+    // Advanced source selection (per feature) + detected interfaces
+    ifaces: Vec<IfaceChoice>,
+    ping_source: SourceUi,
+    trace_source: SourceUi,
+    dns_source: SourceUi,
 }
 
 impl RustyToolsApp {
@@ -199,7 +301,38 @@ impl RustyToolsApp {
             net_message: None,
             delete_confirm: None,
             logs_message: None,
+            ifaces: gather_ifaces(),
+            ping_source: SourceUi::default(),
+            trace_source: SourceUi::default(),
+            dns_source: SourceUi::default(),
         }
+    }
+
+    /// "Advanced" section shared by the feature tabs (source selection).
+    fn advanced_source_ui(&mut self, ui: &mut egui::Ui, id: &str, which: Tab, enabled: bool) {
+        egui::CollapsingHeader::new("Advanced").id_salt(format!("{id}_adv")).show(ui, |ui| {
+            ui.add_enabled_ui(enabled, |ui| {
+                let src = match which {
+                    Tab::Ping => &mut self.ping_source,
+                    Tab::Traceroute => &mut self.trace_source,
+                    _ => &mut self.dns_source,
+                };
+                source_selector(ui, id, src, &self.ifaces);
+                if which == Tab::Dns {
+                    ui.weak("Applies to custom DNS servers only.");
+                }
+                if ui.small_button("🔄 Refresh interface list").clicked() {
+                    self.ifaces = gather_ifaces();
+                    for src in
+                        [&mut self.ping_source, &mut self.trace_source, &mut self.dns_source]
+                    {
+                        if matches!(src.sel, SourceSel::Iface(i) if i >= self.ifaces.len()) {
+                            src.sel = SourceSel::Default;
+                        }
+                    }
+                }
+            });
+        });
     }
 
     fn drain_events(&mut self) {
@@ -378,10 +511,18 @@ impl RustyToolsApp {
             })
             .collect();
         self.ping_log.clear();
+        let source = match source_config(&self.ping_source, &self.ifaces) {
+            Ok(s) => s,
+            Err(e) => {
+                self.ping_error = Some(e);
+                return;
+            }
+        };
         match ping::start(
             targets,
             Duration::from_secs_f32(self.config.ping_interval_s.max(0.1)),
             Duration::from_secs_f32(self.config.ping_timeout_s.max(0.1)),
+            source,
             &self.config.log_dir,
             self.tx.clone(),
         ) {
@@ -442,6 +583,7 @@ impl RustyToolsApp {
                 }
                 ui.end_row();
             });
+            self.advanced_source_ui(ui, "ping_source", Tab::Ping, !running);
             ui.add_space(10.0);
 
             if running {
@@ -615,11 +757,19 @@ impl RustyToolsApp {
                 hops: Vec::new(),
             })
             .collect();
+        let source = match source_config(&self.trace_source, &self.ifaces) {
+            Ok(s) => s,
+            Err(e) => {
+                self.trace_error = Some(e);
+                return;
+            }
+        };
         let params = TraceParams {
             max_hops: self.config.trace_max_hops.max(1),
             probe_interval: Duration::from_secs_f32(self.config.trace_interval_s.max(0.1)),
             probe_timeout: Duration::from_secs_f32(self.config.trace_timeout_s.max(0.1)),
             resolve_names: self.config.trace_resolve_names,
+            source,
         };
         match traceroute::start(targets, params, &self.config.log_dir, self.tx.clone()) {
             Ok(session) => self.trace_session = Some(session),
@@ -699,6 +849,7 @@ impl RustyToolsApp {
             {
                 self.config_dirty = true;
             }
+            self.advanced_source_ui(ui, "trace_source", Tab::Traceroute, !running);
             ui.add_space(10.0);
 
             if running {
@@ -831,11 +982,19 @@ impl RustyToolsApp {
             self.dns_error = Some(format!("Invalid DNS server address: {}", bad.join(", ")));
             return;
         }
+        let source = match source_config(&self.dns_source, &self.ifaces) {
+            Ok(s) => s,
+            Err(e) => {
+                self.dns_error = Some(e);
+                return;
+            }
+        };
         match dns::start(
             targets,
             self.config.dns_record_type.clone(),
             self.config.dns_use_system,
             custom,
+            source,
             &self.config.log_dir,
             self.tx.clone(),
         ) {
@@ -898,6 +1057,7 @@ impl RustyToolsApp {
             {
                 self.config_dirty = true;
             }
+            self.advanced_source_ui(ui, "dns_source", Tab::Dns, !self.dns_running);
             ui.add_space(10.0);
 
             ui.add_enabled_ui(!self.dns_running, |ui| {

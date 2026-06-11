@@ -31,6 +31,17 @@ session average.
 - Path discovery uses the system tool: `tracert` (Windows), `traceroute`
   (macOS/Linux), with a `tracepath` fallback on Linux
 
+### Advanced source selection (Ping, Traceroute, DNS)
+Each of these tabs has an **Advanced** section to pick the probe source —
+default behavior (system routing) is unchanged unless you opt in:
+- **Source interface**: choose among the detected interfaces (refreshable
+  list); probes are bound to that interface's address (plus
+  `SO_BINDTODEVICE` on Linux / `IP_BOUND_IF` on macOS)
+- **Custom source IP**: bind probes to a specific local address
+- Traceroute passes `-s`/`-i` to the system tool on macOS/Linux; Windows
+  `tracert` has no source option so only the per-hop probing honors it
+- For DNS the source applies to the custom servers (not the system resolver)
+
 ### 🌐 DNS lookup
 - Resolve names with the **system DNS** and/or a list of **custom DNS
   servers** (8.8.8.8, 1.1.1.1, a local AD controller, …) and compare the

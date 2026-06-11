@@ -10,7 +10,11 @@ use std::str::FromStr;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
+use std::net::SocketAddr;
+
+use hickory_resolver::config::{
+    NameServerConfig, NameServerConfigGroup, Protocol, ResolverConfig, ResolverOpts,
+};
 use hickory_resolver::proto::rr::RecordType;
 use hickory_resolver::Resolver;
 
@@ -36,11 +40,13 @@ pub enum DnsEvent {
 
 /// Runs every query (target × server) in a background thread; one log file
 /// per run in logs/dns/. Returns the log file path.
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     targets: Vec<String>,
     rtype: String,
     use_system: bool,
     custom: Vec<IpAddr>,
+    source: crate::util::SourceConfig,
     log_dir: &str,
     tx: Sender<Event>,
 ) -> Result<PathBuf, String> {
@@ -83,11 +89,33 @@ pub fn start(
             }
         }
         for ip in custom {
-            let config = ResolverConfig::from_parts(
-                None,
-                Vec::new(),
-                NameServerConfigGroup::from_ips_clear(&[ip], 53, true),
-            );
+            // The source (custom IP or interface address) only applies to
+            // custom servers; the system resolver keeps its own routing.
+            let bind_addr = match source.bind_ip_for(&ip) {
+                Ok(bind) => bind.map(|b| SocketAddr::new(b, 0)),
+                Err(e) => {
+                    let answer = DnsAnswer {
+                        timestamp: util::now_str(),
+                        query: "(resolver setup)".to_string(),
+                        rtype: rtype.clone(),
+                        server: ip.to_string(),
+                        records: Vec::new(),
+                        duration_ms: 0.0,
+                        error: Some(e),
+                    };
+                    log_answer(&mut file, &answer);
+                    let _ = tx.send(Event::Dns(DnsEvent::Answer(answer)));
+                    continue;
+                }
+            };
+            let mut group = NameServerConfigGroup::new();
+            for protocol in [Protocol::Udp, Protocol::Tcp] {
+                let mut ns = NameServerConfig::new(SocketAddr::new(ip, 53), protocol);
+                ns.trust_negative_responses = true;
+                ns.bind_addr = bind_addr;
+                group.push(ns);
+            }
+            let config = ResolverConfig::from_parts(None, Vec::new(), group);
             match Resolver::new(config, opts.clone()) {
                 Ok(r) => servers.push((ip.to_string(), r)),
                 Err(e) => {
