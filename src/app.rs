@@ -1393,7 +1393,7 @@ impl RustyToolsApp {
                                 if itf.is_up {
                                     ui.colored_label(crate::theme::OK, "UP");
                                 } else {
-                                    ui.weak("DOWN");
+                                    ui.colored_label(crate::theme::DANGER, "DOWN");
                                 }
                                 if itf.is_default {
                                     ui.colored_label(crate::theme::ORANGE, "• default route");
