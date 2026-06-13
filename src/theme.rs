@@ -18,6 +18,9 @@ pub const LOGO_INK: Color32 = Color32::from_rgb(0x1C, 0x1A, 0x17);
 // Text.
 pub const TEXT: Color32 = Color32::from_rgb(0xEC, 0xE7, 0xDE);
 pub const TEXT_MUTED: Color32 = Color32::from_rgb(0xA8, 0xA2, 0x9A);
+/// Deliberately dim, for placeholder/hint text drawn manually (egui's own
+/// hint color is capped at a 50% blend and reads too much like a value).
+pub const HINT: Color32 = Color32::from_rgb(0x63, 0x5F, 0x58);
 pub const BORDER: Color32 = Color32::from_rgb(0x3A, 0x36, 0x30);
 
 // Status colors tuned for the dark background.
