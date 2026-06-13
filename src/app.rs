@@ -265,10 +265,22 @@ pub struct RustyToolsApp {
     ping_source: SourceUi,
     trace_source: SourceUi,
     dns_source: SourceUi,
+
+    // Logo texture, built once from the rendered RGBA buffer.
+    logo_tex: Option<egui::TextureHandle>,
+    // Nav rail expands on hover, collapses to icons otherwise.
+    nav_hovered: bool,
 }
 
 impl RustyToolsApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::theme::apply(&cc.egui_ctx);
+        let logo_size = 64;
+        let logo_image = egui::ColorImage::from_rgba_unmultiplied(
+            [logo_size, logo_size],
+            &crate::logo::render_rgba(logo_size as u32),
+        );
+        let logo_tex = Some(cc.egui_ctx.load_texture("logo", logo_image, egui::TextureOptions::LINEAR));
         let (tx, rx) = channel();
         Self {
             tab: Tab::Ping,
@@ -305,6 +317,8 @@ impl RustyToolsApp {
             ping_source: SourceUi::default(),
             trace_source: SourceUi::default(),
             dns_source: SourceUi::default(),
+            logo_tex,
+            nav_hovered: false,
         }
     }
 
@@ -461,35 +475,55 @@ impl RustyToolsApp {
 
     /// "Delete log files" button with a two-step inline confirmation.
     /// Deletes every file in the tab's log subfolder.
-    fn delete_logs_ui(&mut self, ui: &mut egui::Ui, sub: &'static str, enabled: bool) {
-        ui.horizontal(|ui| {
-            if self.delete_confirm == Some(sub) {
-                ui.colored_label(egui::Color32::LIGHT_RED, format!("Delete all files in {sub}/?"));
-                if ui.button("Yes, delete").clicked() {
-                    self.logs_message =
-                        Some(match util::clear_log_files(&self.config.log_dir, sub) {
-                            Ok(n) => format!("{n} log file(s) deleted."),
-                            Err(e) => e,
-                        });
-                    self.delete_confirm = None;
-                }
-                if ui.button("Cancel").clicked() {
-                    self.delete_confirm = None;
-                }
-            } else if ui
-                .add_enabled(enabled, egui::Button::new("🗑 Delete log files"))
-                .on_disabled_hover_text("Stop the running session first")
-                .clicked()
-            {
-                self.delete_confirm = Some(sub);
-                self.logs_message = None;
+    /// Log action buttons added inline to the current row (no wrapping
+    /// layout): open the tab's log subfolder, and delete its logs (two-step
+    /// confirmation, disabled while a session is writing). The status message
+    /// is shown by `logs_message_ui`.
+    fn log_action_buttons(&mut self, ui: &mut egui::Ui, sub: &'static str, enabled: bool) {
+        if ui
+            .button("📂 Open folder")
+            .on_hover_text(format!("Open {sub}/ in the file manager"))
+            .clicked()
+        {
+            match util::ensure_log_dir(&self.config.log_dir, sub) {
+                Ok(path) => util::open_in_file_manager(&path),
+                Err(e) => self.logs_message = Some(format!("cannot open {sub}/: {e}")),
             }
-        });
+        }
+        if self.delete_confirm == Some(sub) {
+            ui.colored_label(crate::theme::DANGER, format!("Delete all files in {sub}/?"));
+            if ui.button("Yes, delete").clicked() {
+                self.logs_message = Some(match util::clear_log_files(&self.config.log_dir, sub) {
+                    Ok(n) => format!("{n} log file(s) deleted."),
+                    Err(e) => e,
+                });
+                self.delete_confirm = None;
+            }
+            if ui.button("Cancel").clicked() {
+                self.delete_confirm = None;
+            }
+        } else if ui
+            .add_enabled(enabled, egui::Button::new("🗑 Delete log files"))
+            .on_disabled_hover_text("Stop the running session first")
+            .clicked()
+        {
+            self.delete_confirm = Some(sub);
+            self.logs_message = None;
+        }
+    }
+
+    fn logs_message_ui(&self, ui: &mut egui::Ui) {
         if self.delete_confirm.is_none() {
             if let Some(msg) = &self.logs_message {
                 ui.weak(msg.clone());
             }
         }
+    }
+
+    /// Stacked log actions (own row + message) for the vertical side panels.
+    fn delete_logs_ui(&mut self, ui: &mut egui::Ui, sub: &'static str, enabled: bool) {
+        ui.horizontal(|ui| self.log_action_buttons(ui, sub, enabled));
+        self.logs_message_ui(ui);
     }
 
     // ---------------------------------------------------------------- Ping
@@ -540,17 +574,21 @@ impl RustyToolsApp {
             self.ping_session = None;
         }
 
-        egui::SidePanel::left("ping_side").default_width(290.0).show(ctx, |ui| {
+        egui::SidePanel::left("ping_side")
+            .resizable(true)
+            .default_width(290.0)
+            .width_range(190.0..=440.0)
+            .show(ctx, |ui| {
             ui.add_space(6.0);
             ui.heading("Continuous ping");
             ui.add_space(6.0);
             ui.label("Targets (one IP or FQDN per line):");
-            ui.add_enabled(
+            multiline_input(
+                ui,
+                &mut self.ping_targets_text,
                 !running,
-                egui::TextEdit::multiline(&mut self.ping_targets_text)
-                    .desired_rows(8)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("8.8.8.8\ngoogle.com\nsrv-ad01.mydomain.local"),
+                8,
+                "8.8.8.8\ngoogle.com\nsrv-ad01.mydomain.local",
             );
             ui.add_space(6.0);
             egui::Grid::new("ping_params").num_columns(2).show(ui, |ui| {
@@ -604,7 +642,7 @@ impl RustyToolsApp {
 
             if let Some(err) = &self.ping_error {
                 ui.add_space(6.0);
-                ui.colored_label(egui::Color32::LIGHT_RED, err);
+                ui.colored_label(crate::theme::DANGER, err);
             }
 
             ui.add_space(10.0);
@@ -630,9 +668,19 @@ impl RustyToolsApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+          egui::ScrollArea::vertical()
+            .id_salt("ping_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.heading("Statistics");
             ui.add_space(4.0);
             egui::ScrollArea::horizontal().id_salt("ping_stats_scroll").show(ui, |ui| {
-                egui::Grid::new("ping_stats").striped(true).min_col_width(56.0).show(ui, |ui| {
+                egui::Grid::new("ping_stats")
+                    .striped(true)
+                    .min_col_width(56.0)
+                    .spacing(egui::vec2(14.0, 6.0))
+                    .show(ui, |ui| {
                     for header in [
                         "Target", "IP", "Sent", "Recv", "Loss", "Last", "Min", "Avg", "Max",
                         "Jitter", "Status",
@@ -659,11 +707,13 @@ impl RustyToolsApp {
                 });
             });
 
-            ui.add_space(6.0);
+            ui.add_space(12.0);
+            ui.heading("Latency");
+            ui.add_space(4.0);
 
-            // Latency graph — the main view, PingPlotter style.
-            let log_open_height = 160.0;
-            let plot_height = (ui.available_height() - log_open_height).max(120.0);
+            // Latency graph — capped to ~half the window so the stats stay
+            // prominent and the page keeps breathing room below.
+            let plot_height = (ctx.screen_rect().height() * 0.48).clamp(200.0, 440.0);
 
             let mut series: Vec<(usize, Vec<Vec<[f64; 2]>>)> = Vec::new();
             let mut losses: Vec<[f64; 2]> = Vec::new();
@@ -714,7 +764,7 @@ impl RustyToolsApp {
                     if !losses.is_empty() {
                         plot_ui.points(
                             Points::new(PlotPoints::from(losses.clone()))
-                                .color(egui::Color32::RED)
+                                .color(crate::theme::DANGER)
                                 .shape(MarkerShape::Cross)
                                 .radius(5.0)
                                 .name("packet loss"),
@@ -722,6 +772,7 @@ impl RustyToolsApp {
                     }
                 });
 
+            ui.add_space(12.0);
             egui::CollapsingHeader::new("Event log").default_open(false).show(ui, |ui| {
                 if ui.button("Clear").clicked() {
                     self.ping_log.clear();
@@ -729,7 +780,7 @@ impl RustyToolsApp {
                 egui::ScrollArea::vertical()
                     .id_salt("ping_log_scroll")
                     .stick_to_bottom(true)
-                    .max_height(log_open_height)
+                    .max_height(180.0)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         for line in &self.ping_log {
@@ -737,6 +788,8 @@ impl RustyToolsApp {
                         }
                     });
             });
+            ui.add_space(16.0);
+          });
         });
     }
 
@@ -783,18 +836,16 @@ impl RustyToolsApp {
             self.trace_session = None;
         }
 
-        egui::SidePanel::left("trace_side").default_width(290.0).show(ctx, |ui| {
+        egui::SidePanel::left("trace_side")
+            .resizable(true)
+            .default_width(290.0)
+            .width_range(190.0..=440.0)
+            .show(ctx, |ui| {
             ui.add_space(6.0);
             ui.heading("Trace (MTR-style)");
             ui.add_space(6.0);
             ui.label("Targets (one IP or FQDN per line):");
-            ui.add_enabled(
-                !running,
-                egui::TextEdit::multiline(&mut self.trace_targets_text)
-                    .desired_rows(8)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("8.8.8.8\ngoogle.com"),
-            );
+            multiline_input(ui, &mut self.trace_targets_text, !running, 8, "8.8.8.8\ngoogle.com");
             ui.add_space(6.0);
             egui::Grid::new("trace_params").num_columns(2).show(ui, |ui| {
                 ui.label("Max hops:");
@@ -870,7 +921,7 @@ impl RustyToolsApp {
 
             if let Some(err) = &self.trace_error {
                 ui.add_space(6.0);
-                ui.colored_label(egui::Color32::LIGHT_RED, err);
+                ui.colored_label(crate::theme::DANGER, err);
             }
 
             ui.add_space(10.0);
@@ -1007,17 +1058,21 @@ impl RustyToolsApp {
     }
 
     fn ui_dns(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("dns_side").default_width(290.0).show(ctx, |ui| {
+        egui::SidePanel::left("dns_side")
+            .resizable(true)
+            .default_width(290.0)
+            .width_range(190.0..=440.0)
+            .show(ctx, |ui| {
             ui.add_space(6.0);
             ui.heading("DNS lookup");
             ui.add_space(6.0);
             ui.label("Names or IPs (one per line, IP = reverse lookup):");
-            ui.add_enabled(
+            multiline_input(
+                ui,
+                &mut self.dns_targets_text,
                 !self.dns_running,
-                egui::TextEdit::multiline(&mut self.dns_targets_text)
-                    .desired_rows(6)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("google.com\nsrv-ad01.mydomain.local\n192.168.1.10"),
+                6,
+                "google.com\nsrv-ad01.mydomain.local\n192.168.1.10",
             );
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -1046,14 +1101,14 @@ impl RustyToolsApp {
                 self.config_dirty = true;
             }
             ui.label("Custom DNS servers (one per line):");
-            if ui
-                .add(
-                    egui::TextEdit::multiline(&mut self.config.dns_custom_servers)
-                        .desired_rows(4)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("8.8.8.8\n1.1.1.1\n192.168.1.5"),
-                )
-                .changed()
+            if multiline_input(
+                ui,
+                &mut self.config.dns_custom_servers,
+                true,
+                4,
+                "8.8.8.8\n1.1.1.1\n192.168.1.5",
+            )
+            .changed()
             {
                 self.config_dirty = true;
             }
@@ -1076,7 +1131,7 @@ impl RustyToolsApp {
             }
             if let Some(err) = &self.dns_error {
                 ui.add_space(6.0);
-                ui.colored_label(egui::Color32::LIGHT_RED, err);
+                ui.colored_label(crate::theme::DANGER, err);
             }
 
             ui.add_space(10.0);
@@ -1120,7 +1175,7 @@ impl RustyToolsApp {
                                 ui.label(format!("{:.1} ms", answer.duration_ms));
                                 match &answer.error {
                                     Some(e) => {
-                                        ui.colored_label(egui::Color32::LIGHT_RED, e);
+                                        ui.colored_label(crate::theme::DANGER, e);
                                     }
                                     None => {
                                         ui.label(answer.records.join("\n"));
@@ -1140,7 +1195,7 @@ impl RustyToolsApp {
     fn ui_arp(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.heading("ARP table");
                 if ui.button("🔄 Refresh").clicked() {
                     let (entries, raw) = arp::gather();
@@ -1186,8 +1241,10 @@ impl RustyToolsApp {
                         },
                     );
                 }
+                ui.separator();
+                self.log_action_buttons(ui, "arp", true);
             });
-            self.delete_logs_ui(ui, "arp", true);
+            self.logs_message_ui(ui);
             if let Some(msg) = &self.arp_message {
                 ui.label(msg.clone());
             }
@@ -1221,7 +1278,12 @@ impl RustyToolsApp {
                                     None => ui.weak("—"),
                                 };
                                 ui.label(&entry.iface);
-                                ui.label(&entry.state);
+                                let state_color = match entry.state.as_str() {
+                                    "reachable" => crate::theme::OK,
+                                    "incomplete" | "failed" => crate::theme::TEXT_MUTED,
+                                    _ => crate::theme::WARN,
+                                };
+                                ui.colored_label(state_color, &entry.state);
                                 ui.end_row();
                             }
                         },
@@ -1251,8 +1313,8 @@ impl RustyToolsApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading("Host network configuration");
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("Network configuration");
                 if ui.button("🔄 Refresh").clicked() {
                     self.net_report = Some(netconfig::gather());
                     self.net_message = None;
@@ -1266,84 +1328,113 @@ impl RustyToolsApp {
                             });
                     }
                 }
+                ui.separator();
+                self.log_action_buttons(ui, "netconfig", true);
             });
-            self.delete_logs_ui(ui, "netconfig", true);
+            self.logs_message_ui(ui);
             if let Some(msg) = &self.net_message {
                 ui.label(msg.clone());
             }
-            ui.add_space(6.0);
+            ui.add_space(8.0);
 
             let Some(report) = &self.net_report else { return };
             egui::ScrollArea::vertical().id_salt("net_scroll").auto_shrink([false, false]).show(
                 ui,
                 |ui| {
-                    egui::Grid::new("net_summary").show(ui, |ui| {
-                        ui.strong("Generated");
-                        ui.label(&report.generated_at);
-                        ui.end_row();
-                        ui.strong("Hostname");
-                        ui.label(&report.hostname);
-                        ui.end_row();
-                        ui.strong("Domain");
-                        ui.label(report.domain.as_deref().unwrap_or("(none)"));
-                        ui.end_row();
-                        ui.strong("DNS servers");
-                        ui.label(if report.dns_servers.is_empty() {
-                            "(none detected)".to_string()
-                        } else {
-                            report.dns_servers.join(", ")
+                    ui.heading("Overview");
+                    ui.add_space(4.0);
+                    egui::Grid::new("net_summary")
+                        .num_columns(2)
+                        .spacing(egui::vec2(18.0, 6.0))
+                        .show(ui, |ui| {
+                            let key = |ui: &mut egui::Ui, k: &str| {
+                                ui.colored_label(crate::theme::TEXT_MUTED, k);
+                            };
+                            key(ui, "Hostname");
+                            ui.strong(&report.hostname);
+                            ui.end_row();
+                            key(ui, "Domain");
+                            ui.label(report.domain.as_deref().unwrap_or("(none)"));
+                            ui.end_row();
+                            key(ui, "DNS servers");
+                            if report.dns_servers.is_empty() {
+                                ui.weak("(none detected)");
+                            } else {
+                                ui.monospace(report.dns_servers.join(", "));
+                            }
+                            ui.end_row();
+                            key(ui, "Generated");
+                            ui.weak(&report.generated_at);
+                            ui.end_row();
                         });
-                        ui.end_row();
-                    });
-                    ui.add_space(8.0);
+                    ui.add_space(12.0);
 
                     ui.heading("Interfaces");
+                    ui.add_space(4.0);
                     for itf in &report.interfaces {
-                        let title = format!(
-                            "{}{}  —  {}{}",
-                            itf.name,
-                            itf.friendly_name
-                                .as_ref()
-                                .filter(|f| *f != &itf.name)
-                                .map(|f| format!(" ({f})"))
-                                .unwrap_or_default(),
-                            if itf.is_up { "UP" } else { "DOWN" },
-                            if itf.is_default { "  [default]" } else { "" }
-                        );
-                        egui::CollapsingHeader::new(title)
-                            .default_open(itf.is_default)
-                            .show(ui, |ui| {
-                                egui::Grid::new(format!("itf_{}", itf.name)).show(ui, |ui| {
-                                    ui.strong("Type");
-                                    ui.label(&itf.if_type);
-                                    ui.end_row();
+                        let mut title = itf.name.clone();
+                        if let Some(f) = itf.friendly_name.as_ref().filter(|f| *f != &itf.name) {
+                            title.push_str(&format!("  ({f})"));
+                        }
+                        let header_color = if itf.is_default {
+                            crate::theme::ORANGE
+                        } else if !itf.is_up {
+                            crate::theme::TEXT_MUTED
+                        } else {
+                            crate::theme::TEXT
+                        };
+                        egui::CollapsingHeader::new(
+                            egui::RichText::new(title).color(header_color).size(15.0),
+                        )
+                        .id_salt(format!("itf_{}", itf.name))
+                        .default_open(itf.is_default)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if itf.is_up {
+                                    ui.colored_label(crate::theme::OK, "UP");
+                                } else {
+                                    ui.colored_label(crate::theme::DANGER, "DOWN");
+                                }
+                                if itf.is_default {
+                                    ui.colored_label(crate::theme::ORANGE, "• default route");
+                                }
+                                ui.weak(format!("• {}", itf.if_type));
+                            });
+                            ui.add_space(2.0);
+                            egui::Grid::new(format!("itf_grid_{}", itf.name))
+                                .num_columns(2)
+                                .spacing(egui::vec2(18.0, 5.0))
+                                .show(ui, |ui| {
+                                    let key = |ui: &mut egui::Ui, k: &str| {
+                                        ui.colored_label(crate::theme::TEXT_MUTED, k);
+                                    };
                                     if let Some(mac) = &itf.mac {
-                                        ui.strong("MAC");
-                                        ui.label(mac);
+                                        key(ui, "MAC");
+                                        ui.monospace(mac);
                                         ui.end_row();
                                     }
                                     for ip in &itf.ipv4 {
-                                        ui.strong("IPv4");
-                                        ui.label(ip);
+                                        key(ui, "IPv4");
+                                        ui.monospace(ip);
                                         ui.end_row();
                                     }
                                     for ip in &itf.ipv6 {
-                                        ui.strong("IPv6");
-                                        ui.label(ip);
+                                        key(ui, "IPv6");
+                                        ui.monospace(ip);
                                         ui.end_row();
                                     }
                                     if let Some(gw) = &itf.gateway {
-                                        ui.strong("Gateway");
-                                        ui.label(gw);
+                                        key(ui, "Gateway");
+                                        ui.monospace(gw);
                                         ui.end_row();
                                     }
                                     if !itf.dns.is_empty() {
-                                        ui.strong("DNS");
-                                        ui.label(itf.dns.join(", "));
+                                        key(ui, "DNS");
+                                        ui.monospace(itf.dns.join(", "));
                                         ui.end_row();
                                     }
                                 });
-                            });
+                        });
                     }
 
                     ui.add_space(8.0);
@@ -1411,9 +1502,27 @@ impl RustyToolsApp {
                 }
             });
             ui.weak(
-                "Subfolders ping/, traceroute/ and netconfig/ are created automatically \
-                 inside the log folder.",
+                "Subfolders are created automatically inside the log folder. \
+                 Use the buttons below to jump straight to one.",
             );
+            ui.add_space(10.0);
+            ui.label("Open a log subfolder:");
+            ui.horizontal_wrapped(|ui| {
+                for (sub, label) in [
+                    ("ping", "📡 Ping"),
+                    ("traceroute", "🛣 Traceroute"),
+                    ("dns", "🌐 DNS"),
+                    ("arp", "📇 ARP"),
+                    ("netconfig", "🖧 Network config"),
+                ] {
+                    if ui.button(label).clicked() {
+                        match util::ensure_log_dir(&self.config.log_dir, sub) {
+                            Ok(path) => util::open_in_file_manager(&path),
+                            Err(e) => self.settings_message = Some(format!("cannot open {sub}/: {e}")),
+                        }
+                    }
+                }
+            });
 
             ui.add_space(16.0);
             ui.separator();
@@ -1424,7 +1533,7 @@ impl RustyToolsApp {
             ));
             if let Some(msg) = &self.settings_message {
                 ui.add_space(6.0);
-                ui.colored_label(egui::Color32::LIGHT_RED, msg);
+                ui.colored_label(crate::theme::DANGER, msg);
             }
         });
     }
@@ -1432,24 +1541,98 @@ impl RustyToolsApp {
 
 use crate::util;
 
+impl RustyToolsApp {
+    /// Logo + one nav row per page. `compact` shows icons only.
+    fn nav_contents(&mut self, ui: &mut egui::Ui, compact: bool) {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if let Some(tex) = &self.logo_tex {
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                    tex.id(),
+                    egui::vec2(30.0, 30.0),
+                )));
+            }
+            if !compact {
+                ui.label(
+                    egui::RichText::new("RustyTools")
+                        .family(egui::FontFamily::Name(crate::theme::ZILLA_BOLD.into()))
+                        .size(19.0)
+                        .color(crate::theme::TEXT),
+                );
+            }
+        });
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        let items = [
+            (Tab::Ping, "📡", "Ping"),
+            (Tab::Traceroute, "\u{1F5FA}", "Traceroute"),
+            (Tab::Dns, "🌐", "DNS"),
+            (Tab::Arp, "📇", "ARP"),
+            (Tab::NetConfig, "🖧", "Network config"),
+            (Tab::Settings, "⚙", "Settings"),
+        ];
+        for (tab, icon, label) in items {
+            let text = if compact { icon.to_string() } else { format!("{icon}  {label}") };
+            let resp = ui.add_sized(
+                [ui.available_width(), 34.0],
+                egui::SelectableLabel::new(self.tab == tab, text),
+            );
+            if compact {
+                resp.clone().on_hover_text(label);
+            }
+            if resp.clicked() {
+                self.tab = tab;
+            }
+        }
+    }
+
+    /// A persistent icon-only rail that reserves layout space; on hover an
+    /// expanded version with labels floats OVER the content (no reflow).
+    fn nav_rail(&mut self, ctx: &egui::Context) {
+        let panel = egui::SidePanel::left("nav_rail")
+            .exact_width(58.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::default()
+                    .fill(crate::theme::BG_SURFACE)
+                    .inner_margin(egui::Margin::same(8)),
+            )
+            .show(ctx, |ui| self.nav_contents(ui, true));
+        let rect = panel.response.rect;
+        let mut hovered = panel.response.contains_pointer();
+
+        if self.nav_hovered {
+            let area = egui::Area::new(egui::Id::new("nav_overlay"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(rect.left_top())
+                .show(ctx, |ui| {
+                    egui::Frame::default()
+                        .fill(crate::theme::BG_SURFACE)
+                        .stroke(egui::Stroke::new(1.0, crate::theme::BORDER))
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.set_width(166.0);
+                            ui.set_min_height(rect.height() - 16.0);
+                            self.nav_contents(ui, false);
+                        });
+                });
+            hovered |= area.response.contains_pointer();
+        }
+
+        if hovered != self.nav_hovered {
+            self.nav_hovered = hovered;
+            ctx.request_repaint();
+        }
+    }
+}
+
 impl eframe::App for RustyToolsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
 
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading("RustyTools");
-                ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::Ping, "📡 Ping");
-                ui.selectable_value(&mut self.tab, Tab::Traceroute, "🛣 Traceroute");
-                ui.selectable_value(&mut self.tab, Tab::Dns, "🌐 DNS");
-                ui.selectable_value(&mut self.tab, Tab::Arp, "📇 ARP");
-                ui.selectable_value(&mut self.tab, Tab::NetConfig, "🖧 Network config");
-                ui.selectable_value(&mut self.tab, Tab::Settings, "⚙ Settings");
-            });
-            ui.add_space(4.0);
-        });
+        self.nav_rail(ctx);
 
         match self.tab {
             Tab::Ping => self.ui_ping(ctx),
@@ -1508,21 +1691,46 @@ fn push_capped(buf: &mut VecDeque<String>, line: String, cap: usize) {
     }
 }
 
+/// A multiline text box with a manually-drawn dim placeholder (egui's own
+/// hint color is too bright — see theme::HINT).
+fn multiline_input(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    enabled: bool,
+    rows: usize,
+    hint: &str,
+) -> egui::Response {
+    let resp = ui.add_enabled(
+        enabled,
+        egui::TextEdit::multiline(text).desired_rows(rows).desired_width(f32::INFINITY),
+    );
+    if text.is_empty() {
+        ui.painter_at(resp.rect).text(
+            resp.rect.left_top() + egui::vec2(6.0, 4.0),
+            egui::Align2::LEFT_TOP,
+            hint,
+            egui::FontId::proportional(14.0),
+            crate::theme::HINT,
+        );
+    }
+    resp
+}
+
 fn loss_color(loss: f64) -> egui::Color32 {
     if loss > 5.0 {
-        egui::Color32::LIGHT_RED
+        crate::theme::DANGER
     } else if loss > 0.0 {
-        egui::Color32::YELLOW
+        crate::theme::WARN
     } else {
-        egui::Color32::LIGHT_GREEN
+        crate::theme::OK
     }
 }
 
 fn status_label(ui: &mut egui::Ui, status: &str) {
     if status.starts_with("ERROR") {
-        ui.colored_label(egui::Color32::LIGHT_RED, status);
+        ui.colored_label(crate::theme::DANGER, status);
     } else if status == "TIMEOUT" {
-        ui.colored_label(egui::Color32::YELLOW, status);
+        ui.colored_label(crate::theme::WARN, status);
     } else {
         ui.label(status);
     }

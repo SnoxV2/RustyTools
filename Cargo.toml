@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 eframe = "0.31"
 egui_plot = "0.31"
+ab_glyph = "0.2"
 chrono = "0.4"
 netdev = "0.31"
 gethostname = "0.5"
