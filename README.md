@@ -3,6 +3,18 @@
 Diagnostic tool for network, system and security administrators. Native GUI
 application (egui), cross-platform: **Windows, macOS, Linux**.
 
+## Look & feel
+
+- Single warm dark theme with Claude-orange (`#D97757`) accents, applied
+  globally.
+- Visual identity: the "R" signal-tile logo (Zilla Slab on an orange tile with
+  engraved signal rings) is drawn as a vector at runtime and reused as the
+  window/dock icon.
+- Left navigation rail with one entry per page; collapses to icons only on a
+  narrow window. Layouts and side panels are resizable/responsive.
+- Each page has buttons to open or clear its log subfolder; Settings has direct
+  shortcuts to every subfolder.
+
 ## Features
 
 ### 📡 Continuous ping
@@ -109,3 +121,9 @@ All files are written under the log folder configured in Settings
 (`Documents/RustyTools/logs` by default), in the `ping/`, `traceroute/`,
 `dns/`, `arp/` and `netconfig/` subfolders. Every line is timestamped with
 millisecond precision.
+
+## Credits
+
+Bundled font: [Zilla Slab](https://github.com/googlefonts/zilla-slab) by
+Typotheque / The Mozilla Foundation, licensed under the SIL Open Font License
+1.1 (`assets/fonts/`).

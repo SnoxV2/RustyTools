@@ -265,10 +265,20 @@ pub struct RustyToolsApp {
     ping_source: SourceUi,
     trace_source: SourceUi,
     dns_source: SourceUi,
+
+    // Logo texture, built once from the rendered RGBA buffer.
+    logo_tex: Option<egui::TextureHandle>,
 }
 
 impl RustyToolsApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        crate::theme::apply(&cc.egui_ctx);
+        let logo_size = 64;
+        let logo_image = egui::ColorImage::from_rgba_unmultiplied(
+            [logo_size, logo_size],
+            &crate::logo::render_rgba(logo_size as u32),
+        );
+        let logo_tex = Some(cc.egui_ctx.load_texture("logo", logo_image, egui::TextureOptions::LINEAR));
         let (tx, rx) = channel();
         Self {
             tab: Tab::Ping,
@@ -305,6 +315,7 @@ impl RustyToolsApp {
             ping_source: SourceUi::default(),
             trace_source: SourceUi::default(),
             dns_source: SourceUi::default(),
+            logo_tex,
         }
     }
 
@@ -461,10 +472,22 @@ impl RustyToolsApp {
 
     /// "Delete log files" button with a two-step inline confirmation.
     /// Deletes every file in the tab's log subfolder.
+    /// Per-tab log actions: open the tab's log subfolder, and delete its logs
+    /// (two-step confirmation, disabled while a session is writing).
     fn delete_logs_ui(&mut self, ui: &mut egui::Ui, sub: &'static str, enabled: bool) {
         ui.horizontal(|ui| {
+            if ui
+                .button("📂 Open folder")
+                .on_hover_text(format!("Open {sub}/ in the file manager"))
+                .clicked()
+            {
+                match util::ensure_log_dir(&self.config.log_dir, sub) {
+                    Ok(path) => util::open_in_file_manager(&path),
+                    Err(e) => self.logs_message = Some(format!("cannot open {sub}/: {e}")),
+                }
+            }
             if self.delete_confirm == Some(sub) {
-                ui.colored_label(egui::Color32::LIGHT_RED, format!("Delete all files in {sub}/?"));
+                ui.colored_label(crate::theme::DANGER, format!("Delete all files in {sub}/?"));
                 if ui.button("Yes, delete").clicked() {
                     self.logs_message =
                         Some(match util::clear_log_files(&self.config.log_dir, sub) {
@@ -540,7 +563,11 @@ impl RustyToolsApp {
             self.ping_session = None;
         }
 
-        egui::SidePanel::left("ping_side").default_width(290.0).show(ctx, |ui| {
+        egui::SidePanel::left("ping_side")
+            .resizable(true)
+            .default_width(290.0)
+            .width_range(190.0..=440.0)
+            .show(ctx, |ui| {
             ui.add_space(6.0);
             ui.heading("Continuous ping");
             ui.add_space(6.0);
@@ -604,7 +631,7 @@ impl RustyToolsApp {
 
             if let Some(err) = &self.ping_error {
                 ui.add_space(6.0);
-                ui.colored_label(egui::Color32::LIGHT_RED, err);
+                ui.colored_label(crate::theme::DANGER, err);
             }
 
             ui.add_space(10.0);
@@ -714,7 +741,7 @@ impl RustyToolsApp {
                     if !losses.is_empty() {
                         plot_ui.points(
                             Points::new(PlotPoints::from(losses.clone()))
-                                .color(egui::Color32::RED)
+                                .color(crate::theme::DANGER)
                                 .shape(MarkerShape::Cross)
                                 .radius(5.0)
                                 .name("packet loss"),
@@ -783,7 +810,11 @@ impl RustyToolsApp {
             self.trace_session = None;
         }
 
-        egui::SidePanel::left("trace_side").default_width(290.0).show(ctx, |ui| {
+        egui::SidePanel::left("trace_side")
+            .resizable(true)
+            .default_width(290.0)
+            .width_range(190.0..=440.0)
+            .show(ctx, |ui| {
             ui.add_space(6.0);
             ui.heading("Trace (MTR-style)");
             ui.add_space(6.0);
@@ -870,7 +901,7 @@ impl RustyToolsApp {
 
             if let Some(err) = &self.trace_error {
                 ui.add_space(6.0);
-                ui.colored_label(egui::Color32::LIGHT_RED, err);
+                ui.colored_label(crate::theme::DANGER, err);
             }
 
             ui.add_space(10.0);
@@ -1007,7 +1038,11 @@ impl RustyToolsApp {
     }
 
     fn ui_dns(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("dns_side").default_width(290.0).show(ctx, |ui| {
+        egui::SidePanel::left("dns_side")
+            .resizable(true)
+            .default_width(290.0)
+            .width_range(190.0..=440.0)
+            .show(ctx, |ui| {
             ui.add_space(6.0);
             ui.heading("DNS lookup");
             ui.add_space(6.0);
@@ -1076,7 +1111,7 @@ impl RustyToolsApp {
             }
             if let Some(err) = &self.dns_error {
                 ui.add_space(6.0);
-                ui.colored_label(egui::Color32::LIGHT_RED, err);
+                ui.colored_label(crate::theme::DANGER, err);
             }
 
             ui.add_space(10.0);
@@ -1120,7 +1155,7 @@ impl RustyToolsApp {
                                 ui.label(format!("{:.1} ms", answer.duration_ms));
                                 match &answer.error {
                                     Some(e) => {
-                                        ui.colored_label(egui::Color32::LIGHT_RED, e);
+                                        ui.colored_label(crate::theme::DANGER, e);
                                     }
                                     None => {
                                         ui.label(answer.records.join("\n"));
@@ -1411,9 +1446,27 @@ impl RustyToolsApp {
                 }
             });
             ui.weak(
-                "Subfolders ping/, traceroute/ and netconfig/ are created automatically \
-                 inside the log folder.",
+                "Subfolders are created automatically inside the log folder. \
+                 Use the buttons below to jump straight to one.",
             );
+            ui.add_space(10.0);
+            ui.label("Open a log subfolder:");
+            ui.horizontal_wrapped(|ui| {
+                for (sub, label) in [
+                    ("ping", "📡 Ping"),
+                    ("traceroute", "🛣 Traceroute"),
+                    ("dns", "🌐 DNS"),
+                    ("arp", "📇 ARP"),
+                    ("netconfig", "🖧 Network config"),
+                ] {
+                    if ui.button(label).clicked() {
+                        match util::ensure_log_dir(&self.config.log_dir, sub) {
+                            Ok(path) => util::open_in_file_manager(&path),
+                            Err(e) => self.settings_message = Some(format!("cannot open {sub}/: {e}")),
+                        }
+                    }
+                }
+            });
 
             ui.add_space(16.0);
             ui.separator();
@@ -1424,7 +1477,7 @@ impl RustyToolsApp {
             ));
             if let Some(msg) = &self.settings_message {
                 ui.add_space(6.0);
-                ui.colored_label(egui::Color32::LIGHT_RED, msg);
+                ui.colored_label(crate::theme::DANGER, msg);
             }
         });
     }
@@ -1432,24 +1485,72 @@ impl RustyToolsApp {
 
 use crate::util;
 
+impl RustyToolsApp {
+    /// Left navigation rail: logo + one row per page. Collapses to icons only
+    /// on a narrow window.
+    fn nav_rail(&mut self, ctx: &egui::Context, compact: bool) {
+        let width = if compact { 58.0 } else { 178.0 };
+        egui::SidePanel::left("nav_rail")
+            .exact_width(width)
+            .resizable(false)
+            .frame(
+                egui::Frame::default()
+                    .fill(crate::theme::BG_SURFACE)
+                    .inner_margin(egui::Margin::same(8)),
+            )
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if let Some(tex) = &self.logo_tex {
+                        ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                            tex.id(),
+                            egui::vec2(30.0, 30.0),
+                        )));
+                    }
+                    if !compact {
+                        ui.label(
+                            egui::RichText::new("RustyTools")
+                                .family(egui::FontFamily::Name(crate::theme::ZILLA_BOLD.into()))
+                                .size(19.0)
+                                .color(crate::theme::TEXT),
+                        );
+                    }
+                });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                let items = [
+                    (Tab::Ping, "📡", "Ping"),
+                    (Tab::Traceroute, "🛣", "Traceroute"),
+                    (Tab::Dns, "🌐", "DNS"),
+                    (Tab::Arp, "📇", "ARP"),
+                    (Tab::NetConfig, "🖧", "Network config"),
+                    (Tab::Settings, "⚙", "Settings"),
+                ];
+                for (tab, icon, label) in items {
+                    let text = if compact { icon.to_string() } else { format!("{icon}  {label}") };
+                    let resp = ui.add_sized(
+                        [ui.available_width(), 34.0],
+                        egui::SelectableLabel::new(self.tab == tab, text),
+                    );
+                    if compact {
+                        resp.clone().on_hover_text(label);
+                    }
+                    if resp.clicked() {
+                        self.tab = tab;
+                    }
+                }
+            });
+    }
+}
+
 impl eframe::App for RustyToolsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
 
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading("RustyTools");
-                ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::Ping, "📡 Ping");
-                ui.selectable_value(&mut self.tab, Tab::Traceroute, "🛣 Traceroute");
-                ui.selectable_value(&mut self.tab, Tab::Dns, "🌐 DNS");
-                ui.selectable_value(&mut self.tab, Tab::Arp, "📇 ARP");
-                ui.selectable_value(&mut self.tab, Tab::NetConfig, "🖧 Network config");
-                ui.selectable_value(&mut self.tab, Tab::Settings, "⚙ Settings");
-            });
-            ui.add_space(4.0);
-        });
+        let compact = ctx.screen_rect().width() < 820.0;
+        self.nav_rail(ctx, compact);
 
         match self.tab {
             Tab::Ping => self.ui_ping(ctx),
@@ -1510,19 +1611,19 @@ fn push_capped(buf: &mut VecDeque<String>, line: String, cap: usize) {
 
 fn loss_color(loss: f64) -> egui::Color32 {
     if loss > 5.0 {
-        egui::Color32::LIGHT_RED
+        crate::theme::DANGER
     } else if loss > 0.0 {
-        egui::Color32::YELLOW
+        crate::theme::WARN
     } else {
-        egui::Color32::LIGHT_GREEN
+        crate::theme::OK
     }
 }
 
 fn status_label(ui: &mut egui::Ui, status: &str) {
     if status.starts_with("ERROR") {
-        ui.colored_label(egui::Color32::LIGHT_RED, status);
+        ui.colored_label(crate::theme::DANGER, status);
     } else if status == "TIMEOUT" {
-        ui.colored_label(egui::Color32::YELLOW, status);
+        ui.colored_label(crate::theme::WARN, status);
     } else {
         ui.label(status);
     }
