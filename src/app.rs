@@ -1393,7 +1393,7 @@ impl RustyToolsApp {
                                 if itf.is_up {
                                     ui.colored_label(crate::theme::OK, "UP");
                                 } else {
-                                    ui.colored_label(crate::theme::DANGER, "DOWN");
+                                    ui.weak("DOWN");
                                 }
                                 if itf.is_default {
                                     ui.colored_label(crate::theme::ORANGE, "• default route");
@@ -1542,68 +1542,87 @@ impl RustyToolsApp {
 use crate::util;
 
 impl RustyToolsApp {
-    /// Left navigation rail: logo + one row per page. Collapses to icons only
-    /// when the pointer is not over it.
+    /// Logo + one nav row per page. `compact` shows icons only.
+    fn nav_contents(&mut self, ui: &mut egui::Ui, compact: bool) {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if let Some(tex) = &self.logo_tex {
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                    tex.id(),
+                    egui::vec2(30.0, 30.0),
+                )));
+            }
+            if !compact {
+                ui.label(
+                    egui::RichText::new("RustyTools")
+                        .family(egui::FontFamily::Name(crate::theme::ZILLA_BOLD.into()))
+                        .size(19.0)
+                        .color(crate::theme::TEXT),
+                );
+            }
+        });
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        let items = [
+            (Tab::Ping, "📡", "Ping"),
+            (Tab::Traceroute, "\u{1F5FA}", "Traceroute"),
+            (Tab::Dns, "🌐", "DNS"),
+            (Tab::Arp, "📇", "ARP"),
+            (Tab::NetConfig, "🖧", "Network config"),
+            (Tab::Settings, "⚙", "Settings"),
+        ];
+        for (tab, icon, label) in items {
+            let text = if compact { icon.to_string() } else { format!("{icon}  {label}") };
+            let resp = ui.add_sized(
+                [ui.available_width(), 34.0],
+                egui::SelectableLabel::new(self.tab == tab, text),
+            );
+            if compact {
+                resp.clone().on_hover_text(label);
+            }
+            if resp.clicked() {
+                self.tab = tab;
+            }
+        }
+    }
+
+    /// A persistent icon-only rail that reserves layout space; on hover an
+    /// expanded version with labels floats OVER the content (no reflow).
     fn nav_rail(&mut self, ctx: &egui::Context) {
-        let compact = !self.nav_hovered;
-        let width = if compact { 58.0 } else { 178.0 };
-        let inner = egui::SidePanel::left("nav_rail")
-            .exact_width(width)
+        let panel = egui::SidePanel::left("nav_rail")
+            .exact_width(58.0)
             .resizable(false)
             .frame(
                 egui::Frame::default()
                     .fill(crate::theme::BG_SURFACE)
                     .inner_margin(egui::Margin::same(8)),
             )
-            .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if let Some(tex) = &self.logo_tex {
-                        ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                            tex.id(),
-                            egui::vec2(30.0, 30.0),
-                        )));
-                    }
-                    if !compact {
-                        ui.label(
-                            egui::RichText::new("RustyTools")
-                                .family(egui::FontFamily::Name(crate::theme::ZILLA_BOLD.into()))
-                                .size(19.0)
-                                .color(crate::theme::TEXT),
-                        );
-                    }
+            .show(ctx, |ui| self.nav_contents(ui, true));
+        let rect = panel.response.rect;
+        let mut hovered = panel.response.contains_pointer();
+
+        if self.nav_hovered {
+            let area = egui::Area::new(egui::Id::new("nav_overlay"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(rect.left_top())
+                .show(ctx, |ui| {
+                    egui::Frame::default()
+                        .fill(crate::theme::BG_SURFACE)
+                        .stroke(egui::Stroke::new(1.0, crate::theme::BORDER))
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.set_width(166.0);
+                            ui.set_min_height(rect.height() - 16.0);
+                            self.nav_contents(ui, false);
+                        });
                 });
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(6.0);
+            hovered |= area.response.contains_pointer();
+        }
 
-                let items = [
-                    (Tab::Ping, "📡", "Ping"),
-                    (Tab::Traceroute, "\u{1F5FA}", "Traceroute"),
-                    (Tab::Dns, "🌐", "DNS"),
-                    (Tab::Arp, "📇", "ARP"),
-                    (Tab::NetConfig, "🖧", "Network config"),
-                    (Tab::Settings, "⚙", "Settings"),
-                ];
-                for (tab, icon, label) in items {
-                    let text = if compact { icon.to_string() } else { format!("{icon}  {label}") };
-                    let resp = ui.add_sized(
-                        [ui.available_width(), 34.0],
-                        egui::SelectableLabel::new(self.tab == tab, text),
-                    );
-                    if compact {
-                        resp.clone().on_hover_text(label);
-                    }
-                    if resp.clicked() {
-                        self.tab = tab;
-                    }
-                }
-            });
-
-        // Expand/collapse on hover (uses last frame's state, so repaint on change).
-        let hovered_now = inner.response.contains_pointer();
-        if hovered_now != self.nav_hovered {
-            self.nav_hovered = hovered_now;
+        if hovered != self.nav_hovered {
+            self.nav_hovered = hovered;
             ctx.request_repaint();
         }
     }
