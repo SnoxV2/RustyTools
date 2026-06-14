@@ -251,6 +251,7 @@ pub struct RustyToolsApp {
     arp_vendors: HashMap<String, String>,
     arp_vendor_running: bool,
     arp_vendor_online: bool,
+    arp_filter: String,
     arp_message: Option<String>,
     arp_auto: bool,
     arp_last_refresh: Instant,
@@ -314,6 +315,7 @@ impl RustyToolsApp {
             arp_vendors: HashMap::new(),
             arp_vendor_running: false,
             arp_vendor_online: false,
+            arp_filter: String::new(),
             arp_message: None,
             arp_auto: false,
             arp_last_refresh: Instant::now(),
@@ -1232,6 +1234,19 @@ impl RustyToolsApp {
                 }
 
                 ui.add_space(10.0);
+                ui.label("Search (IP or MAC):");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.arp_filter)
+                            .desired_width(ui.available_width() - 28.0)
+                            .hint_text("e.g. 192.168.1 or a4:2b"),
+                    );
+                    if ui.button("✖").on_hover_text("Clear search").clicked() {
+                        self.arp_filter.clear();
+                    }
+                });
+
+                ui.add_space(10.0);
                 ui.label("Vendor source:");
                 egui::ComboBox::from_id_salt("arp_vendor_source")
                     .width(ui.available_width())
@@ -1315,15 +1330,38 @@ impl RustyToolsApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(4.0);
-            ui.heading(format!("Devices ({})", self.arp_entries.len()));
+            let total = self.arp_entries.len();
+            let filter = self.arp_filter.trim().to_lowercase();
+            let entries: Vec<&ArpEntry> = self
+                .arp_entries
+                .iter()
+                .filter(|e| {
+                    filter.is_empty()
+                        || e.ip.to_lowercase().contains(&filter)
+                        || e.mac.to_lowercase().contains(&filter)
+                })
+                .collect();
+            if filter.is_empty() {
+                ui.heading(format!("Devices ({total})"));
+            } else {
+                ui.heading(format!("Devices ({} / {total})", entries.len()));
+            }
             ui.add_space(4.0);
-            if self.arp_entries.is_empty() {
+            if total == 0 {
                 ui.label(
                     "Press Refresh to list the devices present in the ARP/neighbor table \
                      of this host, then resolve MAC vendors on demand.",
                 );
                 return;
             }
+            if entries.is_empty() {
+                ui.weak("No device matches the search.");
+                return;
+            }
+
+            // Single-row resolve is recorded here and dispatched after the
+            // table (which holds an immutable borrow of self.arp_entries).
+            let mut resolve_one: Option<String> = None;
             egui::ScrollArea::vertical().id_salt("arp_scroll").auto_shrink([false, false]).show(
                 ui,
                 |ui| {
@@ -1334,16 +1372,28 @@ impl RustyToolsApp {
                                 ui.strong(header);
                             }
                             ui.end_row();
-                            for entry in &self.arp_entries {
+                            for entry in &entries {
                                 ui.label(&entry.ip);
                                 ui.monospace(&entry.mac);
                                 match arp::oui_of(&entry.mac)
                                     .and_then(|oui| self.arp_vendors.get(&oui))
                                 {
-                                    Some(vendor) => ui.label(vendor),
-                                    None if self.arp_vendor_running => ui.weak("…"),
-                                    None => ui.weak("—"),
-                                };
+                                    Some(vendor) => {
+                                        ui.label(vendor);
+                                    }
+                                    None if self.arp_vendor_running => {
+                                        ui.weak("…");
+                                    }
+                                    None => {
+                                        if ui
+                                            .small_button("Resolve")
+                                            .on_hover_text("Resolve this vendor only")
+                                            .clicked()
+                                        {
+                                            resolve_one = Some(entry.mac.clone());
+                                        }
+                                    }
+                                }
                                 ui.label(&entry.iface);
                                 let state_color = match entry.state.as_str() {
                                     "reachable" => crate::theme::OK,
@@ -1368,6 +1418,16 @@ impl RustyToolsApp {
                     );
                 },
             );
+
+            drop(entries);
+            if let Some(mac) = resolve_one {
+                self.arp_vendor_running = true;
+                if self.arp_vendor_online {
+                    arp::lookup_vendors_online(vec![mac], self.tx.clone());
+                } else {
+                    arp::lookup_vendors(vec![mac], self.tx.clone());
+                }
+            }
         });
     }
 
