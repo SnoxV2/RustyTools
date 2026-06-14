@@ -1209,27 +1209,32 @@ impl RustyToolsApp {
             self.arp_raw = raw;
             self.arp_last_refresh = Instant::now();
         }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.heading("ARP table");
-                if ui.button("🔄 Refresh").clicked() {
+        egui::SidePanel::left("arp_side")
+            .resizable(true)
+            .default_width(260.0)
+            .width_range(200.0..=420.0)
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.heading("ARP");
+                ui.add_space(8.0);
+                if ui
+                    .add_sized([ui.available_width(), 30.0], egui::Button::new("🔄 Refresh"))
+                    .clicked()
+                {
                     let (entries, raw) = arp::gather();
                     self.arp_entries = entries;
                     self.arp_raw = raw;
                     self.arp_message = None;
                     self.arp_last_refresh = Instant::now();
                 }
-                if ui.checkbox(&mut self.arp_auto, "Auto 3s").changed() {
+                if ui.checkbox(&mut self.arp_auto, "Auto-refresh (3 s)").changed() {
                     self.arp_last_refresh = Instant::now();
                 }
-                let unresolved: Vec<String> = self
-                    .arp_entries
-                    .iter()
-                    .filter_map(|e| arp::oui_of(&e.mac))
-                    .filter(|oui| !self.arp_vendors.contains_key(oui))
-                    .collect();
+
+                ui.add_space(10.0);
+                ui.label("Vendor source:");
                 egui::ComboBox::from_id_salt("arp_vendor_source")
+                    .width(ui.available_width())
                     .selected_text(if self.arp_vendor_online {
                         "Online (macvendors.com)"
                     } else {
@@ -1243,6 +1248,11 @@ impl RustyToolsApp {
                             "Online (macvendors.com)",
                         );
                     });
+                let unresolved = self
+                    .arp_entries
+                    .iter()
+                    .filter_map(|e| arp::oui_of(&e.mac))
+                    .any(|oui| !self.arp_vendors.contains_key(&oui));
                 let resolve_hint = if self.arp_vendor_online {
                     "Query macvendors.com for each unique OUI (~1/s, OUI only)"
                 } else {
@@ -1250,8 +1260,9 @@ impl RustyToolsApp {
                 };
                 if ui
                     .add_enabled(
-                        !self.arp_vendor_running && !unresolved.is_empty(),
-                        egui::Button::new("🏷 Resolve vendors"),
+                        !self.arp_vendor_running && unresolved,
+                        egui::Button::new("🏷 Resolve vendors")
+                            .min_size(egui::vec2(ui.available_width(), 30.0)),
                     )
                     .on_hover_text(resolve_hint)
                     .clicked()
@@ -1266,10 +1277,19 @@ impl RustyToolsApp {
                     }
                 }
                 if self.arp_vendor_running {
-                    ui.spinner();
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("resolving…");
+                    });
                 }
+
+                ui.add_space(10.0);
                 if ui
-                    .add_enabled(!self.arp_entries.is_empty(), egui::Button::new("💾 Export"))
+                    .add_enabled(
+                        !self.arp_entries.is_empty(),
+                        egui::Button::new("💾 Export")
+                            .min_size(egui::vec2(ui.available_width(), 28.0)),
+                    )
                     .clicked()
                 {
                     self.arp_message = Some(
@@ -1284,15 +1304,19 @@ impl RustyToolsApp {
                         },
                     );
                 }
-                ui.separator();
-                self.log_action_buttons(ui, "arp", true);
-            });
-            self.logs_message_ui(ui);
-            if let Some(msg) = &self.arp_message {
-                ui.label(msg.clone());
-            }
-            ui.add_space(6.0);
 
+                ui.add_space(10.0);
+                self.delete_logs_ui(ui, "arp", true);
+                if let Some(msg) = &self.arp_message {
+                    ui.add_space(4.0);
+                    ui.label(msg.clone());
+                }
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.heading(format!("Devices ({})", self.arp_entries.len()));
+            ui.add_space(4.0);
             if self.arp_entries.is_empty() {
                 ui.label(
                     "Press Refresh to list the devices present in the ARP/neighbor table \
@@ -1357,19 +1381,33 @@ impl RustyToolsApp {
             self.net_last_refresh = Instant::now();
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.heading("Network configuration");
-                if ui.button("🔄 Refresh").clicked() {
+        egui::SidePanel::left("net_side")
+            .resizable(true)
+            .default_width(250.0)
+            .width_range(190.0..=420.0)
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.heading("Network config");
+                ui.add_space(8.0);
+                if ui
+                    .add_sized([ui.available_width(), 30.0], egui::Button::new("🔄 Refresh"))
+                    .clicked()
+                {
                     self.net_report = Some(netconfig::gather());
                     self.net_message = None;
                     self.net_last_refresh = Instant::now();
                 }
-                if ui.checkbox(&mut self.net_auto, "Auto 3s").changed() {
+                if ui.checkbox(&mut self.net_auto, "Auto-refresh (3 s)").changed() {
                     self.net_last_refresh = Instant::now();
                 }
-                if ui.button("💾 Export report").clicked() {
+                ui.add_space(10.0);
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 28.0],
+                        egui::Button::new("💾 Export report"),
+                    )
+                    .clicked()
+                {
                     if let Some(report) = &self.net_report {
                         self.net_message =
                             Some(match netconfig::export(report, &self.config.log_dir) {
@@ -1378,15 +1416,16 @@ impl RustyToolsApp {
                             });
                     }
                 }
-                ui.separator();
-                self.log_action_buttons(ui, "netconfig", true);
+                ui.add_space(10.0);
+                self.delete_logs_ui(ui, "netconfig", true);
+                if let Some(msg) = &self.net_message {
+                    ui.add_space(4.0);
+                    ui.label(msg.clone());
+                }
             });
-            self.logs_message_ui(ui);
-            if let Some(msg) = &self.net_message {
-                ui.label(msg.clone());
-            }
-            ui.add_space(8.0);
 
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(4.0);
             let Some(report) = &self.net_report else { return };
             egui::ScrollArea::vertical().id_salt("net_scroll").auto_shrink([false, false]).show(
                 ui,
