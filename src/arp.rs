@@ -2,9 +2,11 @@
 //! and identifies MAC vendors on demand using the embedded IEEE OUI
 //! database (offline, crate mac_oui).
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use crate::app::Event;
 use crate::util;
@@ -85,6 +87,54 @@ pub fn lookup_vendors(macs: Vec<String>, tx: Sender<Event>) {
         }
         let _ = tx.send(Event::Arp(ArpEvent::Done));
     });
+}
+
+/// Resolves vendors online via the macvendors.com API, using the system
+/// `curl`. Only the OUI prefix (zero-padded to a full MAC) is sent — never
+/// the full device MAC. Unique OUIs are queried once, throttled to respect
+/// the free API's ~1 request/second limit.
+pub fn lookup_vendors_online(macs: Vec<String>, tx: Sender<Event>) {
+    std::thread::spawn(move || {
+        let mut seen = HashSet::new();
+        let mut first = true;
+        for mac in macs {
+            let Some(oui) = oui_of(&mac) else { continue };
+            if !seen.insert(oui.clone()) {
+                continue;
+            }
+            if !first {
+                std::thread::sleep(Duration::from_millis(1100));
+            }
+            first = false;
+            let vendor = query_macvendors(&oui);
+            let _ = tx.send(Event::Arp(ArpEvent::Vendor { oui, vendor }));
+        }
+        let _ = tx.send(Event::Arp(ArpEvent::Done));
+    });
+}
+
+fn query_macvendors(oui: &str) -> String {
+    let url = format!("https://api.macvendors.com/{oui}:00:00:00");
+    let output = util::os_command("curl")
+        .args(["-s", "--max-time", "6", "-w", "\n%{http_code}", &url])
+        .output();
+    match output {
+        Ok(o) => {
+            let body = String::from_utf8_lossy(&o.stdout);
+            let mut lines: Vec<&str> = body.lines().collect();
+            let code = lines.pop().unwrap_or("").trim();
+            let text = lines.join(" ").trim().to_string();
+            match code {
+                "200" if !text.is_empty() => text,
+                "200" => "Unknown".to_string(),
+                "404" => "Unknown (not found online)".to_string(),
+                "429" => "rate limited — try again".to_string(),
+                "000" | "" => "network error (curl could not connect)".to_string(),
+                c => format!("HTTP {c}"),
+            }
+        }
+        Err(e) => format!("cannot run curl: {e}"),
+    }
 }
 
 /// Exports the table (with resolved vendors) to logs/arp/.

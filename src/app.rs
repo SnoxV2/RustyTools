@@ -250,6 +250,7 @@ pub struct RustyToolsApp {
     arp_raw: String,
     arp_vendors: HashMap<String, String>,
     arp_vendor_running: bool,
+    arp_vendor_online: bool,
     arp_message: Option<String>,
     arp_auto: bool,
     arp_last_refresh: Instant,
@@ -312,6 +313,7 @@ impl RustyToolsApp {
             arp_raw: String::new(),
             arp_vendors: HashMap::new(),
             arp_vendor_running: false,
+            arp_vendor_online: false,
             arp_message: None,
             arp_auto: false,
             arp_last_refresh: Instant::now(),
@@ -1227,18 +1229,41 @@ impl RustyToolsApp {
                     .filter_map(|e| arp::oui_of(&e.mac))
                     .filter(|oui| !self.arp_vendors.contains_key(oui))
                     .collect();
+                egui::ComboBox::from_id_salt("arp_vendor_source")
+                    .selected_text(if self.arp_vendor_online {
+                        "Online (macvendors.com)"
+                    } else {
+                        "Local OUI database"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.arp_vendor_online, false, "Local OUI database");
+                        ui.selectable_value(
+                            &mut self.arp_vendor_online,
+                            true,
+                            "Online (macvendors.com)",
+                        );
+                    });
+                let resolve_hint = if self.arp_vendor_online {
+                    "Query macvendors.com for each unique OUI (~1/s, OUI only)"
+                } else {
+                    "Identify manufacturers from the embedded IEEE OUI database"
+                };
                 if ui
                     .add_enabled(
                         !self.arp_vendor_running && !unresolved.is_empty(),
                         egui::Button::new("🏷 Resolve vendors"),
                     )
-                    .on_hover_text("Identify manufacturers from the embedded IEEE OUI database")
+                    .on_hover_text(resolve_hint)
                     .clicked()
                 {
                     self.arp_vendor_running = true;
                     let macs: Vec<String> =
                         self.arp_entries.iter().map(|e| e.mac.clone()).collect();
-                    arp::lookup_vendors(macs, self.tx.clone());
+                    if self.arp_vendor_online {
+                        arp::lookup_vendors_online(macs, self.tx.clone());
+                    } else {
+                        arp::lookup_vendors(macs, self.tx.clone());
+                    }
                 }
                 if self.arp_vendor_running {
                     ui.spinner();
