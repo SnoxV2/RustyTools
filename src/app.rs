@@ -1249,6 +1249,7 @@ impl RustyToolsApp {
             .resizable(false)
             .exact_width(280.0)
             .show(ctx, |ui| {
+                ui.set_max_width(256.0);
                 ui.add_space(6.0);
                 ui.heading("ARP");
                 ui.add_space(8.0);
@@ -1526,6 +1527,7 @@ impl RustyToolsApp {
             .resizable(false)
             .exact_width(270.0)
             .show(ctx, |ui| {
+                ui.set_max_width(246.0);
                 ui.add_space(6.0);
                 ui.heading("Network config");
                 ui.add_space(8.0);
@@ -1976,6 +1978,12 @@ impl eframe::App for RustyToolsApp {
     /// separately in settings.json.
     fn persist_egui_memory(&self) -> bool {
         false
+    }
+
+    /// Clear to the window background so any uncovered sliver between panels
+    /// blends in instead of showing as a black bar.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        crate::theme::BG_WINDOW.to_normalized_gamma_f32()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
