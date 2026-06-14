@@ -21,6 +21,7 @@ pub struct RouteEntry {
     pub gateway: String,
     pub interface: String,
     pub info: String,
+    pub is_ipv6: bool,
 }
 
 pub struct NetReport {
@@ -176,9 +177,20 @@ fn token_after<'a>(tokens: &'a [&'a str], key: &str) -> Option<&'a str> {
 fn parse_routes_bsd(raw: &str) -> Vec<RouteEntry> {
     let mut out = Vec::new();
     let mut in_table = false;
+    let mut is_v6 = false;
     for line in raw.lines() {
         let t: Vec<&str> = line.split_whitespace().collect();
         if t.is_empty() {
+            in_table = false;
+            continue;
+        }
+        if t[0] == "Internet:" {
+            is_v6 = false;
+            in_table = false;
+            continue;
+        }
+        if t[0] == "Internet6:" {
+            is_v6 = true;
             in_table = false;
             continue;
         }
@@ -194,6 +206,7 @@ fn parse_routes_bsd(raw: &str) -> Vec<RouteEntry> {
             gateway: t[1].to_string(),
             interface: t[3].to_string(),
             info: format!("flags {}", t[2]),
+            is_ipv6: is_v6,
         });
     }
     out
@@ -203,8 +216,17 @@ fn parse_routes_bsd(raw: &str) -> Vec<RouteEntry> {
 #[cfg(all(unix, not(target_os = "macos")))]
 fn parse_routes_iproute(raw: &str) -> Vec<RouteEntry> {
     let mut out = Vec::new();
+    let mut is_v6 = false;
     for line in raw.lines() {
         let line = line.trim();
+        if line == "# IPv4" {
+            is_v6 = false;
+            continue;
+        }
+        if line == "# IPv6" {
+            is_v6 = true;
+            continue;
+        }
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -220,6 +242,7 @@ fn parse_routes_iproute(raw: &str) -> Vec<RouteEntry> {
             gateway: token_after(&t, "via").unwrap_or("on-link").to_string(),
             interface: token_after(&t, "dev").unwrap_or("?").to_string(),
             info: info.join(", "),
+            is_ipv6: is_v6 || t[0].contains(':'),
         });
     }
     out
@@ -230,8 +253,19 @@ fn parse_routes_iproute(raw: &str) -> Vec<RouteEntry> {
 fn parse_routes_win(raw: &str) -> Vec<RouteEntry> {
     let mut out = Vec::new();
     let mut in_active = false;
+    let mut is_v6 = false;
     for line in raw.lines() {
         let tl = line.trim();
+        if tl.starts_with("IPv4 Route Table") {
+            is_v6 = false;
+            in_active = false;
+            continue;
+        }
+        if tl.starts_with("IPv6 Route Table") {
+            is_v6 = true;
+            in_active = false;
+            continue;
+        }
         if tl.starts_with("Active Routes:") {
             in_active = true;
             continue;
@@ -239,7 +273,8 @@ fn parse_routes_win(raw: &str) -> Vec<RouteEntry> {
         if !in_active {
             continue;
         }
-        if tl.starts_with("Network Destination") {
+        // Column headers: "Network Destination ..." (v4) / "If Metric ..." (v6).
+        if tl.starts_with("Network Destination") || tl.starts_with("If ") {
             continue;
         }
         if tl.starts_with('=') || tl.is_empty() || tl.starts_with("Persistent") {
@@ -247,13 +282,28 @@ fn parse_routes_win(raw: &str) -> Vec<RouteEntry> {
             continue;
         }
         let t: Vec<&str> = tl.split_whitespace().collect();
-        if t.len() >= 5 && t[0].parse::<std::net::Ipv4Addr>().is_ok() {
-            out.push(RouteEntry {
-                destination: format!("{} {}", t[0], t[1]),
-                gateway: t[2].to_string(),
-                interface: t[3].to_string(),
-                info: format!("metric {}", t[4]),
-            });
+        if !is_v6 {
+            // Network Destination  Netmask  Gateway  Interface  Metric
+            if t.len() >= 5 && t[0].parse::<std::net::Ipv4Addr>().is_ok() {
+                out.push(RouteEntry {
+                    destination: format!("{} {}", t[0], t[1]),
+                    gateway: t[2].to_string(),
+                    interface: t[3].to_string(),
+                    info: format!("metric {}", t[4]),
+                    is_ipv6: false,
+                });
+            }
+        } else {
+            // If  Metric  Network Destination  Gateway
+            if t.len() >= 4 && t[0].parse::<u32>().is_ok() {
+                out.push(RouteEntry {
+                    destination: t[2].to_string(),
+                    gateway: t[3..].join(" "),
+                    interface: format!("if {}", t[0]),
+                    info: format!("metric {}", t[1]),
+                    is_ipv6: true,
+                });
+            }
         }
     }
     out
@@ -341,15 +391,23 @@ pub fn report_text(report: &NetReport) -> String {
     if report.routes.is_empty() {
         s.push_str(&report.routes_raw);
     } else {
-        s.push_str(&format!(
-            "{:<28} {:<20} {:<10} {}\n",
-            "Destination", "Gateway", "Interface", "Info"
-        ));
-        for r in &report.routes {
+        for (label, v6) in [("IPv4", false), ("IPv6", true)] {
+            let rows: Vec<&RouteEntry> =
+                report.routes.iter().filter(|r| r.is_ipv6 == v6).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            s.push_str(&format!("\n-- {label} --\n"));
             s.push_str(&format!(
                 "{:<28} {:<20} {:<10} {}\n",
-                r.destination, r.gateway, r.interface, r.info
+                "Destination", "Gateway", "Interface", "Info"
             ));
+            for r in rows {
+                s.push_str(&format!(
+                    "{:<28} {:<20} {:<10} {}\n",
+                    r.destination, r.gateway, r.interface, r.info
+                ));
+            }
         }
     }
 

@@ -1478,24 +1478,42 @@ impl RustyToolsApp {
                                 .desired_width(f32::INFINITY),
                         );
                     } else {
-                        egui::ScrollArea::horizontal().id_salt("routes_h").show(ui, |ui| {
-                            egui::Grid::new("routes_table")
-                                .striped(true)
-                                .spacing(egui::vec2(16.0, 5.0))
-                                .show(ui, |ui| {
-                                    for h in ["Destination", "Gateway", "Interface", "Info"] {
-                                        ui.strong(h);
-                                    }
-                                    ui.end_row();
-                                    for r in &report.routes {
-                                        ui.monospace(&r.destination);
-                                        ui.monospace(&r.gateway);
-                                        ui.label(&r.interface);
-                                        ui.weak(&r.info);
-                                        ui.end_row();
-                                    }
+                        let routes_grid =
+                            |ui: &mut egui::Ui, id: &str, rows: &[&netconfig::RouteEntry]| {
+                                egui::ScrollArea::horizontal().id_salt(id).show(ui, |ui| {
+                                    egui::Grid::new(format!("{id}_grid"))
+                                        .striped(true)
+                                        .spacing(egui::vec2(16.0, 5.0))
+                                        .show(ui, |ui| {
+                                            for h in
+                                                ["Destination", "Gateway", "Interface", "Info"]
+                                            {
+                                                ui.strong(h);
+                                            }
+                                            ui.end_row();
+                                            for r in rows {
+                                                ui.monospace(&r.destination);
+                                                ui.monospace(&r.gateway);
+                                                ui.label(&r.interface);
+                                                ui.weak(&r.info);
+                                                ui.end_row();
+                                            }
+                                        });
                                 });
-                        });
+                            };
+                        let v4: Vec<&netconfig::RouteEntry> =
+                            report.routes.iter().filter(|r| !r.is_ipv6).collect();
+                        let v6: Vec<&netconfig::RouteEntry> =
+                            report.routes.iter().filter(|r| r.is_ipv6).collect();
+                        if !v4.is_empty() {
+                            ui.label(egui::RichText::new("IPv4").strong());
+                            routes_grid(ui, "routes_v4", &v4);
+                        }
+                        if !v6.is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("IPv6").strong());
+                            routes_grid(ui, "routes_v6", &v6);
+                        }
                         ui.add_space(4.0);
                         egui::CollapsingHeader::new("Raw output").default_open(false).show(
                             ui,
