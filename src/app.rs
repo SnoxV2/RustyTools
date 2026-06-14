@@ -251,10 +251,14 @@ pub struct RustyToolsApp {
     arp_vendors: HashMap<String, String>,
     arp_vendor_running: bool,
     arp_message: Option<String>,
+    arp_auto: bool,
+    arp_last_refresh: Instant,
 
     // Network configuration
     net_report: Option<NetReport>,
     net_message: Option<String>,
+    net_auto: bool,
+    net_last_refresh: Instant,
 
     // Log deletion (two-step confirmation), shared by all tabs
     delete_confirm: Option<&'static str>,
@@ -309,8 +313,12 @@ impl RustyToolsApp {
             arp_vendors: HashMap::new(),
             arp_vendor_running: false,
             arp_message: None,
+            arp_auto: false,
+            arp_last_refresh: Instant::now(),
             net_report: None,
             net_message: None,
+            net_auto: false,
+            net_last_refresh: Instant::now(),
             delete_confirm: None,
             logs_message: None,
             ifaces: gather_ifaces(),
@@ -1193,6 +1201,12 @@ impl RustyToolsApp {
     // ----------------------------------------------------------------- ARP
 
     fn ui_arp(&mut self, ctx: &egui::Context) {
+        if self.arp_auto && self.arp_last_refresh.elapsed() >= Duration::from_secs(3) {
+            let (entries, raw) = arp::gather();
+            self.arp_entries = entries;
+            self.arp_raw = raw;
+            self.arp_last_refresh = Instant::now();
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
@@ -1202,6 +1216,10 @@ impl RustyToolsApp {
                     self.arp_entries = entries;
                     self.arp_raw = raw;
                     self.arp_message = None;
+                    self.arp_last_refresh = Instant::now();
+                }
+                if ui.checkbox(&mut self.arp_auto, "Auto 3s").changed() {
+                    self.arp_last_refresh = Instant::now();
                 }
                 let unresolved: Vec<String> = self
                     .arp_entries
@@ -1307,8 +1325,11 @@ impl RustyToolsApp {
     // ------------------------------------------------------- Network config
 
     fn ui_netconfig(&mut self, ctx: &egui::Context) {
-        if self.net_report.is_none() {
+        if self.net_report.is_none()
+            || (self.net_auto && self.net_last_refresh.elapsed() >= Duration::from_secs(3))
+        {
             self.net_report = Some(netconfig::gather());
+            self.net_last_refresh = Instant::now();
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1318,6 +1339,10 @@ impl RustyToolsApp {
                 if ui.button("🔄 Refresh").clicked() {
                     self.net_report = Some(netconfig::gather());
                     self.net_message = None;
+                    self.net_last_refresh = Instant::now();
+                }
+                if ui.checkbox(&mut self.net_auto, "Auto 3s").changed() {
+                    self.net_last_refresh = Instant::now();
                 }
                 if ui.button("💾 Export report").clicked() {
                     if let Some(report) = &self.net_report {
@@ -1732,6 +1757,8 @@ impl eframe::App for RustyToolsApp {
             || self.arp_vendor_running
         {
             ctx.request_repaint_after(Duration::from_millis(200));
+        } else if self.arp_auto || self.net_auto {
+            ctx.request_repaint_after(Duration::from_millis(750));
         }
     }
 }
