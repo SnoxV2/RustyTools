@@ -289,6 +289,7 @@ pub struct RustyToolsApp {
 impl RustyToolsApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::theme::apply(&cc.egui_ctx);
+        crate::arp::warm_oui_db();
         let logo_size = 64;
         let logo_image = egui::ColorImage::from_rgba_unmultiplied(
             [logo_size, logo_size],

@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::app::Event;
@@ -175,19 +175,31 @@ pub fn is_reachable(entry: &ArpEntry) -> bool {
         && !matches!(entry.state.as_str(), "incomplete" | "failed" | "none")
 }
 
-/// Resolves vendors for the given MACs in a background thread (embedded
-/// IEEE OUI database — works offline).
+/// The embedded IEEE OUI database, built once and reused. Building it parses
+/// ~30k entries (~0.4 s); lookups are then essentially free, so caching it
+/// makes bulk and per-row resolves instant instead of rebuilding every time.
+fn oui_db() -> Option<&'static mac_oui::Oui> {
+    static DB: OnceLock<Option<mac_oui::Oui>> = OnceLock::new();
+    DB.get_or_init(|| mac_oui::Oui::default().ok()).as_ref()
+}
+
+/// Pre-builds the OUI database off the UI thread (call at startup) so the
+/// first local vendor resolve doesn't pay the ~0.4 s build cost.
+pub fn warm_oui_db() {
+    std::thread::spawn(|| {
+        let _ = oui_db();
+    });
+}
+
+/// Resolves vendors for the given MACs in a background thread (cached
+/// embedded IEEE OUI database — works offline, instant after warm-up).
 pub fn lookup_vendors(macs: Vec<String>, tx: Sender<Event>) {
     std::thread::spawn(move || {
-        let db = match mac_oui::Oui::default() {
-            Ok(db) => db,
-            Err(e) => {
-                let _ = tx.send(Event::Arp(ArpEvent::Error(format!(
-                    "failed to load the OUI database: {e}"
-                ))));
-                let _ = tx.send(Event::Arp(ArpEvent::Done));
-                return;
-            }
+        let Some(db) = oui_db() else {
+            let _ = tx
+                .send(Event::Arp(ArpEvent::Error("failed to load the OUI database".to_string())));
+            let _ = tx.send(Event::Arp(ArpEvent::Done));
+            return;
         };
         for mac in macs {
             let Some(normalized) = normalize_mac(&mac) else { continue };
