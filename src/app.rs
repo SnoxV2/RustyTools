@@ -276,6 +276,8 @@ pub struct RustyToolsApp {
     logo_tex: Option<egui::TextureHandle>,
     // Nav rail expands on hover, collapses to icons otherwise.
     nav_hovered: bool,
+    // Settings "delete everything" two-step confirmation.
+    delete_all_confirm: bool,
 }
 
 impl RustyToolsApp {
@@ -331,6 +333,7 @@ impl RustyToolsApp {
             dns_source: SourceUi::default(),
             logo_tex,
             nav_hovered: false,
+            delete_all_confirm: false,
         }
     }
 
@@ -1750,6 +1753,41 @@ impl RustyToolsApp {
                     }
                 }
             });
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Danger zone").color(crate::theme::DANGER).strong());
+            ui.weak("Delete every log file and the log folder itself.");
+            ui.add_space(4.0);
+            if self.delete_all_confirm {
+                ui.colored_label(
+                    crate::theme::DANGER,
+                    format!("Really delete {} and all its contents?", self.config.log_dir),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Yes, delete everything").clicked() {
+                        self.logs_message =
+                            Some(match util::delete_log_dir(&self.config.log_dir) {
+                                Ok(()) => "All logs and the log folder were deleted.".to_string(),
+                                Err(e) => e,
+                            });
+                        self.delete_all_confirm = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.delete_all_confirm = false;
+                    }
+                });
+            } else if ui.button("🗑 Delete all logs (and the folder)").clicked() {
+                self.delete_all_confirm = true;
+                self.logs_message = None;
+            }
+            if !self.delete_all_confirm {
+                if let Some(msg) = &self.logs_message {
+                    ui.add_space(4.0);
+                    ui.weak(msg.clone());
+                }
+            }
 
             ui.add_space(16.0);
             ui.separator();
