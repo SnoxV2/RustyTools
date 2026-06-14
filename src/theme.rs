@@ -31,11 +31,22 @@ pub const DANGER: Color32 = Color32::from_rgb(0xE5, 0x73, 0x73);
 pub const ZILLA: &str = "zilla";
 pub const ZILLA_BOLD: &str = "zilla-bold";
 
-/// Fonts + style + visuals, in that order (style references the families).
+/// Forces a single dark theme regardless of the OS appearance, installs the
+/// bundled fonts, and applies our visuals + heading/spacing tweaks to every
+/// theme slot (so even if egui ever falls back to "light", it stays dark).
 pub fn apply(ctx: &egui::Context) {
     install_fonts(ctx);
-    install_style(ctx);
-    ctx.set_visuals(visuals());
+    ctx.set_theme(egui::ThemePreference::Dark);
+    let v = visuals();
+    ctx.all_styles_mut(|style| {
+        style.text_styles.insert(
+            TextStyle::Heading,
+            FontId::new(20.0, FontFamily::Name(ZILLA.into())),
+        );
+        style.spacing.item_spacing = egui::vec2(8.0, 7.0);
+        style.spacing.button_padding = egui::vec2(9.0, 5.0);
+        style.visuals = v.clone();
+    });
 }
 
 fn install_fonts(ctx: &egui::Context) {
@@ -54,18 +65,6 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn install_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    style.text_styles.insert(
-        TextStyle::Heading,
-        FontId::new(20.0, FontFamily::Name(ZILLA.into())),
-    );
-    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
-    style.spacing.button_padding = egui::vec2(9.0, 5.0);
-    style.visuals.clip_rect_margin = 2.0;
-    ctx.set_style(style);
-}
-
 fn rounding() -> CornerRadius {
     CornerRadius::same(6)
 }
@@ -79,6 +78,7 @@ fn visuals() -> egui::Visuals {
     v.extreme_bg_color = BG_INPUT;
     v.faint_bg_color = BG_SURFACE;
     v.hyperlink_color = ORANGE;
+    v.clip_rect_margin = 2.0;
 
     v.widgets.noninteractive.bg_fill = BG_SURFACE;
     v.widgets.noninteractive.weak_bg_fill = BG_SURFACE;

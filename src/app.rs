@@ -1369,37 +1369,42 @@ impl RustyToolsApp {
                         });
                     ui.add_space(12.0);
 
-                    ui.heading("Interfaces");
-                    ui.add_space(4.0);
-                    for itf in &report.interfaces {
-                        let mut title = itf.name.clone();
-                        if let Some(f) = itf.friendly_name.as_ref().filter(|f| *f != &itf.name) {
-                            title.push_str(&format!("  ({f})"));
-                        }
-                        let header_color = if itf.is_default {
+                    let draw_iface = |ui: &mut egui::Ui, itf: &netconfig::IfaceInfo| {
+                        let dot = if itf.is_up {
+                            crate::theme::OK
+                        } else {
+                            crate::theme::DANGER
+                        };
+                        let name_color = if itf.is_default {
                             crate::theme::ORANGE
                         } else if !itf.is_up {
                             crate::theme::TEXT_MUTED
                         } else {
                             crate::theme::TEXT
                         };
-                        egui::CollapsingHeader::new(
-                            egui::RichText::new(title).color(header_color).size(15.0),
+                        let id = ui.make_persistent_id(format!("itf_{}", itf.name));
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            id,
+                            itf.is_up,
                         )
-                        .id_salt(format!("itf_{}", itf.name))
-                        .default_open(itf.is_default)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                if itf.is_up {
-                                    ui.colored_label(crate::theme::OK, "UP");
-                                } else {
-                                    ui.colored_label(crate::theme::DANGER, "DOWN");
-                                }
-                                if itf.is_default {
-                                    ui.colored_label(crate::theme::ORANGE, "• default route");
-                                }
-                                ui.weak(format!("• {}", itf.if_type));
-                            });
+                        .show_header(ui, |ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                            ui.painter().circle_filled(rect.center(), 4.5, dot);
+                            let mut title = itf.name.clone();
+                            if let Some(f) =
+                                itf.friendly_name.as_ref().filter(|f| *f != &itf.name)
+                            {
+                                title.push_str(&format!("  ({f})"));
+                            }
+                            ui.label(egui::RichText::new(title).color(name_color).size(15.0));
+                            if itf.is_default {
+                                ui.colored_label(crate::theme::ORANGE, "default route");
+                            }
+                        })
+                        .body(|ui| {
+                            ui.weak(&itf.if_type);
                             ui.add_space(2.0);
                             egui::Grid::new(format!("itf_grid_{}", itf.name))
                                 .num_columns(2)
@@ -1435,19 +1440,74 @@ impl RustyToolsApp {
                                     }
                                 });
                         });
+                    };
+
+                    let up: Vec<&netconfig::IfaceInfo> =
+                        report.interfaces.iter().filter(|i| i.is_up).collect();
+                    let down: Vec<&netconfig::IfaceInfo> =
+                        report.interfaces.iter().filter(|i| !i.is_up).collect();
+
+                    ui.heading(format!("Active interfaces ({})", up.len()));
+                    ui.add_space(4.0);
+                    for itf in &up {
+                        draw_iface(ui, itf);
+                    }
+                    if up.is_empty() {
+                        ui.weak("(none up)");
                     }
 
-                    ui.add_space(8.0);
-                    egui::CollapsingHeader::new("Routing table").default_open(true).show(
-                        ui,
-                        |ui| {
-                            ui.add(
-                                egui::TextEdit::multiline(&mut report.routes.as_str())
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(f32::INFINITY),
-                            );
-                        },
-                    );
+                    if !down.is_empty() {
+                        ui.add_space(12.0);
+                        ui.heading(
+                            egui::RichText::new(format!("Inactive interfaces ({})", down.len()))
+                                .color(crate::theme::TEXT_MUTED),
+                        );
+                        ui.add_space(4.0);
+                        for itf in &down {
+                            draw_iface(ui, itf);
+                        }
+                    }
+
+                    ui.add_space(12.0);
+                    ui.heading("Routing table");
+                    ui.add_space(4.0);
+                    if report.routes.is_empty() {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut report.routes_raw.as_str())
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY),
+                        );
+                    } else {
+                        egui::ScrollArea::horizontal().id_salt("routes_h").show(ui, |ui| {
+                            egui::Grid::new("routes_table")
+                                .striped(true)
+                                .spacing(egui::vec2(16.0, 5.0))
+                                .show(ui, |ui| {
+                                    for h in ["Destination", "Gateway", "Interface", "Info"] {
+                                        ui.strong(h);
+                                    }
+                                    ui.end_row();
+                                    for r in &report.routes {
+                                        ui.monospace(&r.destination);
+                                        ui.monospace(&r.gateway);
+                                        ui.label(&r.interface);
+                                        ui.weak(&r.info);
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                        ui.add_space(4.0);
+                        egui::CollapsingHeader::new("Raw output").default_open(false).show(
+                            ui,
+                            |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut report.routes_raw.as_str())
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            },
+                        );
+                    }
 
                     for (title, content) in &report.raw_sections {
                         egui::CollapsingHeader::new(format!("Raw output: {title}"))
