@@ -166,6 +166,15 @@ pub fn oui_of(mac: &str) -> Option<String> {
     normalize_mac(mac).map(|m| m[..8].to_string())
 }
 
+/// Whether an entry is a real, reachable device: it has a valid MAC and its
+/// state is not an incomplete/failed one. Works across the per-OS states
+/// (macOS reachable/incomplete, Linux REACHABLE/STALE/INCOMPLETE→lowercased,
+/// Windows dynamic/static).
+pub fn is_reachable(entry: &ArpEntry) -> bool {
+    normalize_mac(&entry.mac).is_some()
+        && !matches!(entry.state.as_str(), "incomplete" | "failed" | "none")
+}
+
 /// Resolves vendors for the given MACs in a background thread (embedded
 /// IEEE OUI database — works offline).
 pub fn lookup_vendors(macs: Vec<String>, tx: Sender<Event>) {

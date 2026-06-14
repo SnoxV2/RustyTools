@@ -252,6 +252,7 @@ pub struct RustyToolsApp {
     arp_vendor_running: bool,
     arp_vendor_online: bool,
     arp_filter: String,
+    arp_only_reachable: bool,
     arp_message: Option<String>,
     arp_auto: bool,
     arp_last_refresh: Instant,
@@ -323,6 +324,7 @@ impl RustyToolsApp {
             arp_vendor_running: false,
             arp_vendor_online: false,
             arp_filter: String::new(),
+            arp_only_reachable: false,
             arp_message: None,
             arp_auto: false,
             arp_last_refresh: Instant::now(),
@@ -1321,6 +1323,7 @@ impl RustyToolsApp {
                         self.arp_filter.clear();
                     }
                 });
+                ui.checkbox(&mut self.arp_only_reachable, "Reachable only (hide incomplete)");
 
                 ui.add_space(10.0);
                 ui.label("Vendor source:");
@@ -1411,6 +1414,7 @@ impl RustyToolsApp {
             let entries: Vec<&ArpEntry> = self
                 .arp_entries
                 .iter()
+                .filter(|e| !self.arp_only_reachable || arp::is_reachable(e))
                 .filter(|e| {
                     filter.is_empty()
                         || e.ip.to_lowercase().contains(&filter)
