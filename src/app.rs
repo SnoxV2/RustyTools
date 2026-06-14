@@ -1971,6 +1971,13 @@ impl RustyToolsApp {
 }
 
 impl eframe::App for RustyToolsApp {
+    /// Don't persist egui memory across runs (panel sizes, etc.) so the layout
+    /// always starts from our defined defaults — our own settings are saved
+    /// separately in settings.json.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
 
