@@ -3,9 +3,11 @@
 //! database (offline, crate mac_oui).
 
 use std::collections::HashSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::app::Event;
@@ -22,6 +24,109 @@ pub enum ArpEvent {
     Vendor { oui: String, vendor: String },
     Error(String),
     Done,
+    ScanProgress { done: usize, total: usize, alive: usize },
+    ScanDone { alive: usize },
+}
+
+/// A local IPv4 subnet that can be ICMP-swept.
+#[derive(Clone)]
+pub struct Subnet {
+    pub label: String,
+    pub hosts: Vec<Ipv4Addr>,
+}
+
+/// Lists the local IPv4 subnets of up interfaces that are small enough to
+/// sweep (≤ 1024 hosts, i.e. prefix ≥ 22).
+pub fn local_subnets() -> Vec<Subnet> {
+    let mut out: Vec<Subnet> = Vec::new();
+    let mut seen = HashSet::new();
+    for itf in netdev::get_interfaces() {
+        if !itf.is_up() {
+            continue;
+        }
+        for net in &itf.ipv4 {
+            let prefix = net.prefix_len();
+            if !(22..=30).contains(&prefix) {
+                continue;
+            }
+            let hosts = enumerate_hosts(net.addr(), prefix);
+            if hosts.is_empty() || hosts.len() > 1024 {
+                continue;
+            }
+            let network = hosts[0];
+            if !seen.insert((network, prefix)) {
+                continue;
+            }
+            out.push(Subnet {
+                label: format!("{} — {}/{} ({} hosts)", itf.name, network, prefix, hosts.len()),
+                hosts,
+            });
+        }
+    }
+    out
+}
+
+/// All usable host addresses of `addr/prefix` (network and broadcast excluded).
+fn enumerate_hosts(addr: Ipv4Addr, prefix: u8) -> Vec<Ipv4Addr> {
+    let ip = u32::from(addr);
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix as u32) };
+    let network = ip & mask;
+    let broadcast = network | !mask;
+    if broadcast <= network + 1 {
+        return Vec::new();
+    }
+    (network + 1..broadcast).map(Ipv4Addr::from).collect()
+}
+
+/// ICMP-sweeps the given hosts (one probe each, 1 s timeout) using a pool of
+/// worker threads. Responding hosts get their ARP entry populated by the OS;
+/// the caller re-reads the ARP table on ScanDone. Progress is streamed.
+pub fn scan_subnet(hosts: Vec<Ipv4Addr>, tx: Sender<Event>) {
+    std::thread::spawn(move || {
+        let total = hosts.len();
+        if total == 0 {
+            let _ = tx.send(Event::Arp(ArpEvent::ScanDone { alive: 0 }));
+            return;
+        }
+        let hosts = Arc::new(hosts);
+        let next = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        let alive = Arc::new(AtomicUsize::new(0));
+        let workers = 64.min(total);
+
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let hosts = hosts.clone();
+            let next = next.clone();
+            let done = done.clone();
+            let alive = alive.clone();
+            let tx = tx.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut backend = crate::ping::Backend::new(crate::util::SourceConfig::default());
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= hosts.len() {
+                        break;
+                    }
+                    let ip = IpAddr::V4(hosts[i]);
+                    let seq = (i as u16).wrapping_add(1);
+                    if backend.ping(ip, Duration::from_secs(1), seq).is_ok() {
+                        alive.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = tx.send(Event::Arp(ArpEvent::ScanProgress {
+                        done: d,
+                        total,
+                        alive: alive.load(Ordering::Relaxed),
+                    }));
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        let _ = tx.send(Event::Arp(ArpEvent::ScanDone { alive: alive.load(Ordering::Relaxed) }));
+    });
 }
 
 /// Reads the ARP/neighbor table. Returns the parsed entries plus the raw

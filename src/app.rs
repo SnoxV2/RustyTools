@@ -255,6 +255,11 @@ pub struct RustyToolsApp {
     arp_message: Option<String>,
     arp_auto: bool,
     arp_last_refresh: Instant,
+    arp_subnets: Vec<arp::Subnet>,
+    arp_subnets_loaded: bool,
+    arp_subnet_sel: usize,
+    arp_scanning: bool,
+    arp_scan: Option<(usize, usize, usize)>,
 
     // Network configuration
     net_report: Option<NetReport>,
@@ -321,6 +326,11 @@ impl RustyToolsApp {
             arp_message: None,
             arp_auto: false,
             arp_last_refresh: Instant::now(),
+            arp_subnets: Vec::new(),
+            arp_subnets_loaded: false,
+            arp_subnet_sel: 0,
+            arp_scanning: false,
+            arp_scan: None,
             net_report: None,
             net_message: None,
             net_auto: false,
@@ -376,6 +386,20 @@ impl RustyToolsApp {
                 }
                 Event::Arp(ArpEvent::Error(msg)) => self.arp_message = Some(msg),
                 Event::Arp(ArpEvent::Done) => self.arp_vendor_running = false,
+                Event::Arp(ArpEvent::ScanProgress { done, total, alive }) => {
+                    self.arp_scan = Some((done, total, alive));
+                }
+                Event::Arp(ArpEvent::ScanDone { alive }) => {
+                    self.arp_scanning = false;
+                    self.arp_scan = None;
+                    let (entries, raw) = arp::gather();
+                    self.arp_entries = entries;
+                    self.arp_raw = raw;
+                    self.arp_last_refresh = Instant::now();
+                    self.arp_message = Some(format!(
+                        "Scan complete: {alive} host(s) responded. ARP table refreshed."
+                    ));
+                }
             }
         }
     }
@@ -1214,10 +1238,13 @@ impl RustyToolsApp {
             self.arp_raw = raw;
             self.arp_last_refresh = Instant::now();
         }
+        if !self.arp_subnets_loaded {
+            self.arp_subnets = arp::local_subnets();
+            self.arp_subnets_loaded = true;
+        }
         egui::SidePanel::left("arp_side")
-            .resizable(true)
-            .default_width(260.0)
-            .width_range(200.0..=420.0)
+            .resizable(false)
+            .exact_width(280.0)
             .show(ctx, |ui| {
                 ui.add_space(6.0);
                 ui.heading("ARP");
@@ -1231,9 +1258,55 @@ impl RustyToolsApp {
                     self.arp_raw = raw;
                     self.arp_message = None;
                     self.arp_last_refresh = Instant::now();
+                    self.arp_subnets = arp::local_subnets();
                 }
                 if ui.checkbox(&mut self.arp_auto, "Auto-refresh (3 s)").changed() {
                     self.arp_last_refresh = Instant::now();
+                }
+
+                ui.add_space(10.0);
+                ui.label("Subnet ICMP scan:");
+                if self.arp_subnets.is_empty() {
+                    ui.weak("No scannable local subnet detected.");
+                } else {
+                    let sel = self.arp_subnet_sel.min(self.arp_subnets.len() - 1);
+                    self.arp_subnet_sel = sel;
+                    let options: Vec<(usize, String)> = self
+                        .arp_subnets
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (i, s.label.clone()))
+                        .collect();
+                    egui::ComboBox::from_id_salt("arp_subnet")
+                        .width(ui.available_width())
+                        .selected_text(self.arp_subnets[sel].label.clone())
+                        .show_ui(ui, |ui| {
+                            for (i, label) in &options {
+                                ui.selectable_value(&mut self.arp_subnet_sel, *i, label);
+                            }
+                        });
+                    if self.arp_scanning {
+                        let (done, total, alive) = self.arp_scan.unwrap_or((0, 0, 0));
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!("Scanning {done}/{total} — {alive} up"));
+                        });
+                    } else if ui
+                        .add_sized(
+                            [ui.available_width(), 30.0],
+                            egui::Button::new("📡 Scan subnet (ICMP)"),
+                        )
+                        .on_hover_text(
+                            "Ping every host (1 probe, 1 s timeout) to reveal devices and \
+                             populate the ARP table",
+                        )
+                        .clicked()
+                    {
+                        let hosts = self.arp_subnets[sel].hosts.clone();
+                        self.arp_scan = Some((0, hosts.len(), 0));
+                        self.arp_scanning = true;
+                        arp::scan_subnet(hosts, self.tx.clone());
+                    }
                 }
 
                 ui.add_space(10.0);
@@ -1445,9 +1518,8 @@ impl RustyToolsApp {
         }
 
         egui::SidePanel::left("net_side")
-            .resizable(true)
-            .default_width(250.0)
-            .width_range(190.0..=420.0)
+            .resizable(false)
+            .exact_width(270.0)
             .show(ctx, |ui| {
                 ui.add_space(6.0);
                 ui.heading("Network config");
@@ -1917,6 +1989,7 @@ impl eframe::App for RustyToolsApp {
             || self.trace_session.is_some()
             || self.dns_running
             || self.arp_vendor_running
+            || self.arp_scanning
         {
             ctx.request_repaint_after(Duration::from_millis(200));
         } else if self.arp_auto || self.net_auto {

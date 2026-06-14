@@ -65,6 +65,12 @@ default behavior (system routing) is unchanged unless you opt in:
 ### 📇 ARP
 - Lists the devices in the host ARP/neighbor table (`arp`/`ip neigh`):
   IP, MAC, interface, state
+- **Subnet ICMP scan** — pick one of the detected local subnets and sweep it
+  (one probe per host, 1 s timeout, run concurrently) to reveal hosts not yet
+  in the ARP table; responding hosts populate the cache and the table is
+  refreshed automatically
+- **Search** by IP or MAC to find a machine; **resolve a single row's vendor**
+  on demand
 - **Vendor identification on demand**, with two selectable sources:
   - **Local OUI database** — embedded IEEE OUI database (offline, instant)
   - **Online (macvendors.com)** — queries the macvendors.com API via the
