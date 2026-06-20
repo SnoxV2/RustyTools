@@ -16,13 +16,22 @@ pub struct IfaceInfo {
     pub dns: Vec<String>,
 }
 
+pub struct RouteEntry {
+    pub destination: String,
+    pub gateway: String,
+    pub interface: String,
+    pub info: String,
+    pub is_ipv6: bool,
+}
+
 pub struct NetReport {
     pub generated_at: String,
     pub hostname: String,
     pub domain: Option<String>,
     pub dns_servers: Vec<String>,
     pub interfaces: Vec<IfaceInfo>,
-    pub routes: String,
+    pub routes: Vec<RouteEntry>,
+    pub routes_raw: String,
     pub raw_sections: Vec<(String, String)>,
 }
 
@@ -89,13 +98,15 @@ pub fn gather() -> NetReport {
         }
     }
 
+    let (routes, routes_raw) = gather_routes();
     NetReport {
         generated_at: util::now_str(),
         hostname,
         domain,
         dns_servers,
         interfaces,
-        routes: routes_text(),
+        routes,
+        routes_raw,
         raw_sections: raw_sections(),
     }
 }
@@ -128,24 +139,174 @@ fn domain_and_dns() -> (Option<String>, Vec<String>) {
     }
 }
 
-fn routes_text() -> String {
+/// Returns the parsed routing table plus the raw command output it came from.
+fn gather_routes() -> (Vec<RouteEntry>, String) {
     #[cfg(windows)]
     {
-        util::run_capture("route", &["print"])
+        let raw = util::run_capture("route", &["print"]);
+        (parse_routes_win(&raw), raw)
     }
     #[cfg(target_os = "macos")]
     {
-        util::run_capture("netstat", &["-rn"])
+        let raw = util::run_capture("netstat", &["-rn"]);
+        (parse_routes_bsd(&raw), raw)
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let v4 = util::run_capture("ip", &["route", "show"]);
         if v4.starts_with("Cannot run") {
-            return util::run_capture("netstat", &["-rn"]);
+            let raw = util::run_capture("netstat", &["-rn"]);
+            let parsed = parse_routes_bsd(&raw);
+            return (parsed, raw);
         }
         let v6 = util::run_capture("ip", &["-6", "route", "show"]);
-        format!("# IPv4\n{v4}\n# IPv6\n{v6}")
+        let raw = format!("# IPv4\n{v4}\n# IPv6\n{v6}");
+        (parse_routes_iproute(&raw), raw)
     }
+}
+
+/// Helper: the token right after `key` in a whitespace-split line.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn token_after<'a>(tokens: &'a [&'a str], key: &str) -> Option<&'a str> {
+    tokens.iter().position(|t| *t == key).and_then(|i| tokens.get(i + 1)).copied()
+}
+
+/// Parses `netstat -rn` (macOS / BSD; also the Linux fallback).
+/// Columns per section: Destination Gateway Flags Netif [Expire].
+#[cfg(unix)]
+fn parse_routes_bsd(raw: &str) -> Vec<RouteEntry> {
+    let mut out = Vec::new();
+    let mut in_table = false;
+    let mut is_v6 = false;
+    for line in raw.lines() {
+        let t: Vec<&str> = line.split_whitespace().collect();
+        if t.is_empty() {
+            in_table = false;
+            continue;
+        }
+        if t[0] == "Internet:" {
+            is_v6 = false;
+            in_table = false;
+            continue;
+        }
+        if t[0] == "Internet6:" {
+            is_v6 = true;
+            in_table = false;
+            continue;
+        }
+        if t[0] == "Destination" {
+            in_table = true;
+            continue;
+        }
+        if !in_table || t.len() < 4 {
+            continue;
+        }
+        out.push(RouteEntry {
+            destination: t[0].to_string(),
+            gateway: t[1].to_string(),
+            interface: t[3].to_string(),
+            info: format!("flags {}", t[2]),
+            is_ipv6: is_v6,
+        });
+    }
+    out
+}
+
+/// Parses `ip route show` (Linux).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn parse_routes_iproute(raw: &str) -> Vec<RouteEntry> {
+    let mut out = Vec::new();
+    let mut is_v6 = false;
+    for line in raw.lines() {
+        let line = line.trim();
+        if line == "# IPv4" {
+            is_v6 = false;
+            continue;
+        }
+        if line == "# IPv6" {
+            is_v6 = true;
+            continue;
+        }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let t: Vec<&str> = line.split_whitespace().collect();
+        let mut info = Vec::new();
+        for key in ["proto", "scope", "metric", "src"] {
+            if let Some(v) = token_after(&t, key) {
+                info.push(format!("{key} {v}"));
+            }
+        }
+        out.push(RouteEntry {
+            destination: t[0].to_string(),
+            gateway: token_after(&t, "via").unwrap_or("on-link").to_string(),
+            interface: token_after(&t, "dev").unwrap_or("?").to_string(),
+            info: info.join(", "),
+            is_ipv6: is_v6 || t[0].contains(':'),
+        });
+    }
+    out
+}
+
+/// Parses the "Active Routes" IPv4 table of `route print` (Windows).
+#[cfg(windows)]
+fn parse_routes_win(raw: &str) -> Vec<RouteEntry> {
+    let mut out = Vec::new();
+    let mut in_active = false;
+    let mut is_v6 = false;
+    for line in raw.lines() {
+        let tl = line.trim();
+        if tl.starts_with("IPv4 Route Table") {
+            is_v6 = false;
+            in_active = false;
+            continue;
+        }
+        if tl.starts_with("IPv6 Route Table") {
+            is_v6 = true;
+            in_active = false;
+            continue;
+        }
+        if tl.starts_with("Active Routes:") {
+            in_active = true;
+            continue;
+        }
+        if !in_active {
+            continue;
+        }
+        // Column headers: "Network Destination ..." (v4) / "If Metric ..." (v6).
+        if tl.starts_with("Network Destination") || tl.starts_with("If ") {
+            continue;
+        }
+        if tl.starts_with('=') || tl.is_empty() || tl.starts_with("Persistent") {
+            in_active = false;
+            continue;
+        }
+        let t: Vec<&str> = tl.split_whitespace().collect();
+        if !is_v6 {
+            // Network Destination  Netmask  Gateway  Interface  Metric
+            if t.len() >= 5 && t[0].parse::<std::net::Ipv4Addr>().is_ok() {
+                out.push(RouteEntry {
+                    destination: format!("{} {}", t[0], t[1]),
+                    gateway: t[2].to_string(),
+                    interface: t[3].to_string(),
+                    info: format!("metric {}", t[4]),
+                    is_ipv6: false,
+                });
+            }
+        } else {
+            // If  Metric  Network Destination  Gateway
+            if t.len() >= 4 && t[0].parse::<u32>().is_ok() {
+                out.push(RouteEntry {
+                    destination: t[2].to_string(),
+                    gateway: t[3..].join(" "),
+                    interface: format!("if {}", t[0]),
+                    info: format!("metric {}", t[1]),
+                    is_ipv6: true,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Raw output of the system tools, for verification or copy/paste.
@@ -227,7 +388,28 @@ pub fn report_text(report: &NetReport) -> String {
     }
 
     s.push_str("\n=== ROUTES ===\n");
-    s.push_str(&report.routes);
+    if report.routes.is_empty() {
+        s.push_str(&report.routes_raw);
+    } else {
+        for (label, v6) in [("IPv4", false), ("IPv6", true)] {
+            let rows: Vec<&RouteEntry> =
+                report.routes.iter().filter(|r| r.is_ipv6 == v6).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            s.push_str(&format!("\n-- {label} --\n"));
+            s.push_str(&format!(
+                "{:<28} {:<20} {:<10} {}\n",
+                "Destination", "Gateway", "Interface", "Info"
+            ));
+            for r in rows {
+                s.push_str(&format!(
+                    "{:<28} {:<20} {:<10} {}\n",
+                    r.destination, r.gateway, r.interface, r.info
+                ));
+            }
+        }
+    }
 
     for (title, content) in &report.raw_sections {
         s.push_str(&format!("\n=== {title} ===\n{content}\n"));

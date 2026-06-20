@@ -2,9 +2,13 @@
 //! and identifies MAC vendors on demand using the embedded IEEE OUI
 //! database (offline, crate mac_oui).
 
-use std::net::IpAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use crate::app::Event;
 use crate::util;
@@ -20,6 +24,109 @@ pub enum ArpEvent {
     Vendor { oui: String, vendor: String },
     Error(String),
     Done,
+    ScanProgress { done: usize, total: usize, alive: usize },
+    ScanDone { alive: usize },
+}
+
+/// A local IPv4 subnet that can be ICMP-swept.
+#[derive(Clone)]
+pub struct Subnet {
+    pub label: String,
+    pub hosts: Vec<Ipv4Addr>,
+}
+
+/// Lists the local IPv4 subnets of up interfaces that are small enough to
+/// sweep (≤ 1024 hosts, i.e. prefix ≥ 22).
+pub fn local_subnets() -> Vec<Subnet> {
+    let mut out: Vec<Subnet> = Vec::new();
+    let mut seen = HashSet::new();
+    for itf in netdev::get_interfaces() {
+        if !itf.is_up() {
+            continue;
+        }
+        for net in &itf.ipv4 {
+            let prefix = net.prefix_len();
+            if !(22..=30).contains(&prefix) {
+                continue;
+            }
+            let hosts = enumerate_hosts(net.addr(), prefix);
+            if hosts.is_empty() || hosts.len() > 1024 {
+                continue;
+            }
+            let network = hosts[0];
+            if !seen.insert((network, prefix)) {
+                continue;
+            }
+            out.push(Subnet {
+                label: format!("{} — {}/{} ({} hosts)", itf.name, network, prefix, hosts.len()),
+                hosts,
+            });
+        }
+    }
+    out
+}
+
+/// All usable host addresses of `addr/prefix` (network and broadcast excluded).
+fn enumerate_hosts(addr: Ipv4Addr, prefix: u8) -> Vec<Ipv4Addr> {
+    let ip = u32::from(addr);
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix as u32) };
+    let network = ip & mask;
+    let broadcast = network | !mask;
+    if broadcast <= network + 1 {
+        return Vec::new();
+    }
+    (network + 1..broadcast).map(Ipv4Addr::from).collect()
+}
+
+/// ICMP-sweeps the given hosts (one probe each, 1 s timeout) using a pool of
+/// worker threads. Responding hosts get their ARP entry populated by the OS;
+/// the caller re-reads the ARP table on ScanDone. Progress is streamed.
+pub fn scan_subnet(hosts: Vec<Ipv4Addr>, tx: Sender<Event>) {
+    std::thread::spawn(move || {
+        let total = hosts.len();
+        if total == 0 {
+            let _ = tx.send(Event::Arp(ArpEvent::ScanDone { alive: 0 }));
+            return;
+        }
+        let hosts = Arc::new(hosts);
+        let next = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        let alive = Arc::new(AtomicUsize::new(0));
+        let workers = 64.min(total);
+
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let hosts = hosts.clone();
+            let next = next.clone();
+            let done = done.clone();
+            let alive = alive.clone();
+            let tx = tx.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut backend = crate::ping::Backend::new(crate::util::SourceConfig::default());
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= hosts.len() {
+                        break;
+                    }
+                    let ip = IpAddr::V4(hosts[i]);
+                    let seq = (i as u16).wrapping_add(1);
+                    if backend.ping(ip, Duration::from_secs(1), seq).is_ok() {
+                        alive.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = tx.send(Event::Arp(ArpEvent::ScanProgress {
+                        done: d,
+                        total,
+                        alive: alive.load(Ordering::Relaxed),
+                    }));
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        let _ = tx.send(Event::Arp(ArpEvent::ScanDone { alive: alive.load(Ordering::Relaxed) }));
+    });
 }
 
 /// Reads the ARP/neighbor table. Returns the parsed entries plus the raw
@@ -59,19 +166,40 @@ pub fn oui_of(mac: &str) -> Option<String> {
     normalize_mac(mac).map(|m| m[..8].to_string())
 }
 
-/// Resolves vendors for the given MACs in a background thread (embedded
-/// IEEE OUI database — works offline).
+/// Whether an entry is a real, reachable device: it has a valid MAC and its
+/// state is not an incomplete/failed one. Works across the per-OS states
+/// (macOS reachable/incomplete, Linux REACHABLE/STALE/INCOMPLETE→lowercased,
+/// Windows dynamic/static).
+pub fn is_reachable(entry: &ArpEntry) -> bool {
+    normalize_mac(&entry.mac).is_some()
+        && !matches!(entry.state.as_str(), "incomplete" | "failed" | "none")
+}
+
+/// The embedded IEEE OUI database, built once and reused. Building it parses
+/// ~30k entries (~0.4 s); lookups are then essentially free, so caching it
+/// makes bulk and per-row resolves instant instead of rebuilding every time.
+fn oui_db() -> Option<&'static mac_oui::Oui> {
+    static DB: OnceLock<Option<mac_oui::Oui>> = OnceLock::new();
+    DB.get_or_init(|| mac_oui::Oui::default().ok()).as_ref()
+}
+
+/// Pre-builds the OUI database off the UI thread (call at startup) so the
+/// first local vendor resolve doesn't pay the ~0.4 s build cost.
+pub fn warm_oui_db() {
+    std::thread::spawn(|| {
+        let _ = oui_db();
+    });
+}
+
+/// Resolves vendors for the given MACs in a background thread (cached
+/// embedded IEEE OUI database — works offline, instant after warm-up).
 pub fn lookup_vendors(macs: Vec<String>, tx: Sender<Event>) {
     std::thread::spawn(move || {
-        let db = match mac_oui::Oui::default() {
-            Ok(db) => db,
-            Err(e) => {
-                let _ = tx.send(Event::Arp(ArpEvent::Error(format!(
-                    "failed to load the OUI database: {e}"
-                ))));
-                let _ = tx.send(Event::Arp(ArpEvent::Done));
-                return;
-            }
+        let Some(db) = oui_db() else {
+            let _ = tx
+                .send(Event::Arp(ArpEvent::Error("failed to load the OUI database".to_string())));
+            let _ = tx.send(Event::Arp(ArpEvent::Done));
+            return;
         };
         for mac in macs {
             let Some(normalized) = normalize_mac(&mac) else { continue };
@@ -85,6 +213,54 @@ pub fn lookup_vendors(macs: Vec<String>, tx: Sender<Event>) {
         }
         let _ = tx.send(Event::Arp(ArpEvent::Done));
     });
+}
+
+/// Resolves vendors online via the macvendors.com API, using the system
+/// `curl`. Only the OUI prefix (zero-padded to a full MAC) is sent — never
+/// the full device MAC. Unique OUIs are queried once, throttled to respect
+/// the free API's ~1 request/second limit.
+pub fn lookup_vendors_online(macs: Vec<String>, tx: Sender<Event>) {
+    std::thread::spawn(move || {
+        let mut seen = HashSet::new();
+        let mut first = true;
+        for mac in macs {
+            let Some(oui) = oui_of(&mac) else { continue };
+            if !seen.insert(oui.clone()) {
+                continue;
+            }
+            if !first {
+                std::thread::sleep(Duration::from_millis(1100));
+            }
+            first = false;
+            let vendor = query_macvendors(&oui);
+            let _ = tx.send(Event::Arp(ArpEvent::Vendor { oui, vendor }));
+        }
+        let _ = tx.send(Event::Arp(ArpEvent::Done));
+    });
+}
+
+fn query_macvendors(oui: &str) -> String {
+    let url = format!("https://api.macvendors.com/{oui}:00:00:00");
+    let output = util::os_command("curl")
+        .args(["-s", "--max-time", "6", "-w", "\n%{http_code}", &url])
+        .output();
+    match output {
+        Ok(o) => {
+            let body = String::from_utf8_lossy(&o.stdout);
+            let mut lines: Vec<&str> = body.lines().collect();
+            let code = lines.pop().unwrap_or("").trim();
+            let text = lines.join(" ").trim().to_string();
+            match code {
+                "200" if !text.is_empty() => text,
+                "200" => "Unknown".to_string(),
+                "404" => "Unknown (not found online)".to_string(),
+                "429" => "rate limited — try again".to_string(),
+                "000" | "" => "network error (curl could not connect)".to_string(),
+                c => format!("HTTP {c}"),
+            }
+        }
+        Err(e) => format!("cannot run curl: {e}"),
+    }
 }
 
 /// Exports the table (with resolved vendors) to logs/arp/.

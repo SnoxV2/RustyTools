@@ -119,6 +119,17 @@ pub fn clear_log_files(base: &str, sub: &str) -> Result<usize, String> {
     Ok(deleted)
 }
 
+/// Deletes the entire log directory: every subfolder, every file, and the
+/// folder itself. A missing folder is treated as success.
+pub fn delete_log_dir(base: &str) -> Result<(), String> {
+    let dir = PathBuf::from(if base.trim().is_empty() { "logs" } else { base.trim() });
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot delete {}: {e}", dir.display())),
+    }
+}
+
 /// Builds a system command without spawning a console window on Windows.
 pub fn os_command(prog: &str) -> Command {
     #[allow(unused_mut)]

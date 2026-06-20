@@ -3,6 +3,18 @@
 Diagnostic tool for network, system and security administrators. Native GUI
 application (egui), cross-platform: **Windows, macOS, Linux**.
 
+## Look & feel
+
+- Single warm dark theme with Claude-orange (`#D97757`) accents, applied
+  globally.
+- Visual identity: the "R" signal-tile logo (Zilla Slab on an orange tile with
+  engraved signal rings) is drawn as a vector at runtime and reused as the
+  window/dock icon.
+- Left navigation rail with one entry per page; collapses to icons only on a
+  narrow window. Layouts and side panels are resizable/responsive.
+- Each page has buttons to open or clear its log subfolder; Settings has direct
+  shortcuts to every subfolder.
+
 ## Features
 
 ### 📡 Continuous ping
@@ -53,8 +65,18 @@ default behavior (system routing) is unchanged unless you opt in:
 ### 📇 ARP
 - Lists the devices in the host ARP/neighbor table (`arp`/`ip neigh`):
   IP, MAC, interface, state
-- **Vendor identification on demand** from the embedded IEEE OUI database
-  (offline, no API rate limits)
+- **Subnet ICMP scan** — pick one of the detected local subnets and sweep it
+  (one probe per host, 1 s timeout, run concurrently) to reveal hosts not yet
+  in the ARP table; responding hosts populate the cache and the table is
+  refreshed automatically
+- **Search** by IP or MAC to find a machine; **resolve a single row's vendor**
+  on demand
+- **Vendor identification on demand**, with two selectable sources:
+  - **Local OUI database** — embedded IEEE OUI database (offline, instant)
+  - **Online (macvendors.com)** — queries the macvendors.com API via the
+    system `curl`; only the OUI prefix (zero-padded) is sent, never the full
+    device MAC, and unique OUIs are throttled to ~1 request/second
+- Optional **auto-refresh** every 3 s (checkbox)
 - Table export (with vendors) to `logs/arp/`
 
 ### 🖧 Network configuration
@@ -109,3 +131,9 @@ All files are written under the log folder configured in Settings
 (`Documents/RustyTools/logs` by default), in the `ping/`, `traceroute/`,
 `dns/`, `arp/` and `netconfig/` subfolders. Every line is timestamped with
 millisecond precision.
+
+## Credits
+
+Bundled font: [Zilla Slab](https://github.com/googlefonts/zilla-slab) by
+Typotheque / The Mozilla Foundation, licensed under the SIL Open Font License
+1.1 (`assets/fonts/`).
