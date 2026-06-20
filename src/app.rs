@@ -250,11 +250,23 @@ pub struct RustyToolsApp {
     arp_raw: String,
     arp_vendors: HashMap<String, String>,
     arp_vendor_running: bool,
+    arp_vendor_online: bool,
+    arp_filter: String,
+    arp_only_reachable: bool,
     arp_message: Option<String>,
+    arp_auto: bool,
+    arp_last_refresh: Instant,
+    arp_subnets: Vec<arp::Subnet>,
+    arp_subnets_loaded: bool,
+    arp_subnet_sel: usize,
+    arp_scanning: bool,
+    arp_scan: Option<(usize, usize, usize)>,
 
     // Network configuration
     net_report: Option<NetReport>,
     net_message: Option<String>,
+    net_auto: bool,
+    net_last_refresh: Instant,
 
     // Log deletion (two-step confirmation), shared by all tabs
     delete_confirm: Option<&'static str>,
@@ -270,11 +282,14 @@ pub struct RustyToolsApp {
     logo_tex: Option<egui::TextureHandle>,
     // Nav rail expands on hover, collapses to icons otherwise.
     nav_hovered: bool,
+    // Settings "delete everything" two-step confirmation.
+    delete_all_confirm: bool,
 }
 
 impl RustyToolsApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         crate::theme::apply(&cc.egui_ctx);
+        crate::arp::warm_oui_db();
         let logo_size = 64;
         let logo_image = egui::ColorImage::from_rgba_unmultiplied(
             [logo_size, logo_size],
@@ -308,9 +323,21 @@ impl RustyToolsApp {
             arp_raw: String::new(),
             arp_vendors: HashMap::new(),
             arp_vendor_running: false,
+            arp_vendor_online: false,
+            arp_filter: String::new(),
+            arp_only_reachable: false,
             arp_message: None,
+            arp_auto: false,
+            arp_last_refresh: Instant::now(),
+            arp_subnets: Vec::new(),
+            arp_subnets_loaded: false,
+            arp_subnet_sel: 0,
+            arp_scanning: false,
+            arp_scan: None,
             net_report: None,
             net_message: None,
+            net_auto: false,
+            net_last_refresh: Instant::now(),
             delete_confirm: None,
             logs_message: None,
             ifaces: gather_ifaces(),
@@ -319,6 +346,7 @@ impl RustyToolsApp {
             dns_source: SourceUi::default(),
             logo_tex,
             nav_hovered: false,
+            delete_all_confirm: false,
         }
     }
 
@@ -361,6 +389,20 @@ impl RustyToolsApp {
                 }
                 Event::Arp(ArpEvent::Error(msg)) => self.arp_message = Some(msg),
                 Event::Arp(ArpEvent::Done) => self.arp_vendor_running = false,
+                Event::Arp(ArpEvent::ScanProgress { done, total, alive }) => {
+                    self.arp_scan = Some((done, total, alive));
+                }
+                Event::Arp(ArpEvent::ScanDone { alive }) => {
+                    self.arp_scanning = false;
+                    self.arp_scan = None;
+                    let (entries, raw) = arp::gather();
+                    self.arp_entries = entries;
+                    self.arp_raw = raw;
+                    self.arp_last_refresh = Instant::now();
+                    self.arp_message = Some(format!(
+                        "Scan complete: {alive} host(s) responded. ARP table refreshed."
+                    ));
+                }
             }
         }
     }
@@ -1193,40 +1235,157 @@ impl RustyToolsApp {
     // ----------------------------------------------------------------- ARP
 
     fn ui_arp(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.heading("ARP table");
-                if ui.button("🔄 Refresh").clicked() {
+        if self.arp_auto && self.arp_last_refresh.elapsed() >= Duration::from_secs(3) {
+            let (entries, raw) = arp::gather();
+            self.arp_entries = entries;
+            self.arp_raw = raw;
+            self.arp_last_refresh = Instant::now();
+        }
+        if !self.arp_subnets_loaded {
+            self.arp_subnets = arp::local_subnets();
+            self.arp_subnets_loaded = true;
+        }
+        egui::SidePanel::left("arp_side")
+            .resizable(false)
+            .exact_width(280.0)
+            .show(ctx, |ui| {
+                ui.set_max_width(256.0);
+                ui.add_space(6.0);
+                ui.heading("ARP");
+                ui.add_space(8.0);
+                if ui
+                    .add_sized([ui.available_width(), 30.0], egui::Button::new("🔄 Refresh"))
+                    .clicked()
+                {
                     let (entries, raw) = arp::gather();
                     self.arp_entries = entries;
                     self.arp_raw = raw;
                     self.arp_message = None;
+                    self.arp_last_refresh = Instant::now();
+                    self.arp_subnets = arp::local_subnets();
                 }
-                let unresolved: Vec<String> = self
+                if ui.checkbox(&mut self.arp_auto, "Auto-refresh (3 s)").changed() {
+                    self.arp_last_refresh = Instant::now();
+                }
+
+                ui.add_space(10.0);
+                ui.label("Subnet ICMP scan:");
+                if self.arp_subnets.is_empty() {
+                    ui.weak("No scannable local subnet detected.");
+                } else {
+                    let sel = self.arp_subnet_sel.min(self.arp_subnets.len() - 1);
+                    self.arp_subnet_sel = sel;
+                    let options: Vec<(usize, String)> = self
+                        .arp_subnets
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (i, s.label.clone()))
+                        .collect();
+                    egui::ComboBox::from_id_salt("arp_subnet")
+                        .width(ui.available_width())
+                        .selected_text(self.arp_subnets[sel].label.clone())
+                        .show_ui(ui, |ui| {
+                            for (i, label) in &options {
+                                ui.selectable_value(&mut self.arp_subnet_sel, *i, label);
+                            }
+                        });
+                    if self.arp_scanning {
+                        let (done, total, alive) = self.arp_scan.unwrap_or((0, 0, 0));
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!("Scanning {done}/{total} — {alive} up"));
+                        });
+                    } else if ui
+                        .add_sized(
+                            [ui.available_width(), 30.0],
+                            egui::Button::new("📡 Scan subnet (ICMP)"),
+                        )
+                        .on_hover_text(
+                            "Ping every host (1 probe, 1 s timeout) to reveal devices and \
+                             populate the ARP table",
+                        )
+                        .clicked()
+                    {
+                        let hosts = self.arp_subnets[sel].hosts.clone();
+                        self.arp_scan = Some((0, hosts.len(), 0));
+                        self.arp_scanning = true;
+                        arp::scan_subnet(hosts, self.tx.clone());
+                    }
+                }
+
+                ui.add_space(10.0);
+                ui.label("Search (IP or MAC):");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.arp_filter)
+                            .desired_width(ui.available_width() - 28.0)
+                            .hint_text("e.g. 192.168.1 or a4:2b"),
+                    );
+                    if ui.button("✖").on_hover_text("Clear search").clicked() {
+                        self.arp_filter.clear();
+                    }
+                });
+                ui.checkbox(&mut self.arp_only_reachable, "Reachable only (hide incomplete)");
+
+                ui.add_space(10.0);
+                ui.label("Vendor source:");
+                egui::ComboBox::from_id_salt("arp_vendor_source")
+                    .width(ui.available_width())
+                    .selected_text(if self.arp_vendor_online {
+                        "Online (macvendors.com)"
+                    } else {
+                        "Local OUI database"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.arp_vendor_online, false, "Local OUI database");
+                        ui.selectable_value(
+                            &mut self.arp_vendor_online,
+                            true,
+                            "Online (macvendors.com)",
+                        );
+                    });
+                let unresolved = self
                     .arp_entries
                     .iter()
                     .filter_map(|e| arp::oui_of(&e.mac))
-                    .filter(|oui| !self.arp_vendors.contains_key(oui))
-                    .collect();
+                    .any(|oui| !self.arp_vendors.contains_key(&oui));
+                let resolve_hint = if self.arp_vendor_online {
+                    "Query macvendors.com for each unique OUI (~1/s, OUI only)"
+                } else {
+                    "Identify manufacturers from the embedded IEEE OUI database"
+                };
                 if ui
                     .add_enabled(
-                        !self.arp_vendor_running && !unresolved.is_empty(),
-                        egui::Button::new("🏷 Resolve vendors"),
+                        !self.arp_vendor_running && unresolved,
+                        egui::Button::new("🏷 Resolve vendors")
+                            .min_size(egui::vec2(ui.available_width(), 30.0)),
                     )
-                    .on_hover_text("Identify manufacturers from the embedded IEEE OUI database")
+                    .on_hover_text(resolve_hint)
                     .clicked()
                 {
                     self.arp_vendor_running = true;
                     let macs: Vec<String> =
                         self.arp_entries.iter().map(|e| e.mac.clone()).collect();
-                    arp::lookup_vendors(macs, self.tx.clone());
+                    if self.arp_vendor_online {
+                        arp::lookup_vendors_online(macs, self.tx.clone());
+                    } else {
+                        arp::lookup_vendors(macs, self.tx.clone());
+                    }
                 }
                 if self.arp_vendor_running {
-                    ui.spinner();
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("resolving…");
+                    });
                 }
+
+                ui.add_space(10.0);
                 if ui
-                    .add_enabled(!self.arp_entries.is_empty(), egui::Button::new("💾 Export"))
+                    .add_enabled(
+                        !self.arp_entries.is_empty(),
+                        egui::Button::new("💾 Export")
+                            .min_size(egui::vec2(ui.available_width(), 28.0)),
+                    )
                     .clicked()
                 {
                     self.arp_message = Some(
@@ -1241,22 +1400,50 @@ impl RustyToolsApp {
                         },
                     );
                 }
-                ui.separator();
-                self.log_action_buttons(ui, "arp", true);
-            });
-            self.logs_message_ui(ui);
-            if let Some(msg) = &self.arp_message {
-                ui.label(msg.clone());
-            }
-            ui.add_space(6.0);
 
-            if self.arp_entries.is_empty() {
+                ui.add_space(10.0);
+                self.delete_logs_ui(ui, "arp", true);
+                if let Some(msg) = &self.arp_message {
+                    ui.add_space(4.0);
+                    ui.label(msg.clone());
+                }
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(4.0);
+            let total = self.arp_entries.len();
+            let filter = self.arp_filter.trim().to_lowercase();
+            let entries: Vec<&ArpEntry> = self
+                .arp_entries
+                .iter()
+                .filter(|e| !self.arp_only_reachable || arp::is_reachable(e))
+                .filter(|e| {
+                    filter.is_empty()
+                        || e.ip.to_lowercase().contains(&filter)
+                        || e.mac.to_lowercase().contains(&filter)
+                })
+                .collect();
+            if filter.is_empty() {
+                ui.heading(format!("Devices ({total})"));
+            } else {
+                ui.heading(format!("Devices ({} / {total})", entries.len()));
+            }
+            ui.add_space(4.0);
+            if total == 0 {
                 ui.label(
                     "Press Refresh to list the devices present in the ARP/neighbor table \
                      of this host, then resolve MAC vendors on demand.",
                 );
                 return;
             }
+            if entries.is_empty() {
+                ui.weak("No device matches the search.");
+                return;
+            }
+
+            // Single-row resolve is recorded here and dispatched after the
+            // table (which holds an immutable borrow of self.arp_entries).
+            let mut resolve_one: Option<String> = None;
             egui::ScrollArea::vertical().id_salt("arp_scroll").auto_shrink([false, false]).show(
                 ui,
                 |ui| {
@@ -1267,16 +1454,28 @@ impl RustyToolsApp {
                                 ui.strong(header);
                             }
                             ui.end_row();
-                            for entry in &self.arp_entries {
+                            for entry in &entries {
                                 ui.label(&entry.ip);
                                 ui.monospace(&entry.mac);
                                 match arp::oui_of(&entry.mac)
                                     .and_then(|oui| self.arp_vendors.get(&oui))
                                 {
-                                    Some(vendor) => ui.label(vendor),
-                                    None if self.arp_vendor_running => ui.weak("…"),
-                                    None => ui.weak("—"),
-                                };
+                                    Some(vendor) => {
+                                        ui.label(vendor);
+                                    }
+                                    None if self.arp_vendor_running => {
+                                        ui.weak("…");
+                                    }
+                                    None => {
+                                        if ui
+                                            .small_button("Resolve")
+                                            .on_hover_text("Resolve this vendor only")
+                                            .clicked()
+                                        {
+                                            resolve_one = Some(entry.mac.clone());
+                                        }
+                                    }
+                                }
                                 ui.label(&entry.iface);
                                 let state_color = match entry.state.as_str() {
                                     "reachable" => crate::theme::OK,
@@ -1301,25 +1500,56 @@ impl RustyToolsApp {
                     );
                 },
             );
+
+            drop(entries);
+            if let Some(mac) = resolve_one {
+                self.arp_vendor_running = true;
+                if self.arp_vendor_online {
+                    arp::lookup_vendors_online(vec![mac], self.tx.clone());
+                } else {
+                    arp::lookup_vendors(vec![mac], self.tx.clone());
+                }
+            }
         });
     }
 
     // ------------------------------------------------------- Network config
 
     fn ui_netconfig(&mut self, ctx: &egui::Context) {
-        if self.net_report.is_none() {
+        if self.net_report.is_none()
+            || (self.net_auto && self.net_last_refresh.elapsed() >= Duration::from_secs(3))
+        {
             self.net_report = Some(netconfig::gather());
+            self.net_last_refresh = Instant::now();
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.heading("Network configuration");
-                if ui.button("🔄 Refresh").clicked() {
+        egui::SidePanel::left("net_side")
+            .resizable(false)
+            .exact_width(270.0)
+            .show(ctx, |ui| {
+                ui.set_max_width(246.0);
+                ui.add_space(6.0);
+                ui.heading("Network config");
+                ui.add_space(8.0);
+                if ui
+                    .add_sized([ui.available_width(), 30.0], egui::Button::new("🔄 Refresh"))
+                    .clicked()
+                {
                     self.net_report = Some(netconfig::gather());
                     self.net_message = None;
+                    self.net_last_refresh = Instant::now();
                 }
-                if ui.button("💾 Export report").clicked() {
+                if ui.checkbox(&mut self.net_auto, "Auto-refresh (3 s)").changed() {
+                    self.net_last_refresh = Instant::now();
+                }
+                ui.add_space(10.0);
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 28.0],
+                        egui::Button::new("💾 Export report"),
+                    )
+                    .clicked()
+                {
                     if let Some(report) = &self.net_report {
                         self.net_message =
                             Some(match netconfig::export(report, &self.config.log_dir) {
@@ -1328,15 +1558,16 @@ impl RustyToolsApp {
                             });
                     }
                 }
-                ui.separator();
-                self.log_action_buttons(ui, "netconfig", true);
+                ui.add_space(10.0);
+                self.delete_logs_ui(ui, "netconfig", true);
+                if let Some(msg) = &self.net_message {
+                    ui.add_space(4.0);
+                    ui.label(msg.clone());
+                }
             });
-            self.logs_message_ui(ui);
-            if let Some(msg) = &self.net_message {
-                ui.label(msg.clone());
-            }
-            ui.add_space(8.0);
 
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(4.0);
             let Some(report) = &self.net_report else { return };
             egui::ScrollArea::vertical().id_salt("net_scroll").auto_shrink([false, false]).show(
                 ui,
@@ -1369,37 +1600,42 @@ impl RustyToolsApp {
                         });
                     ui.add_space(12.0);
 
-                    ui.heading("Interfaces");
-                    ui.add_space(4.0);
-                    for itf in &report.interfaces {
-                        let mut title = itf.name.clone();
-                        if let Some(f) = itf.friendly_name.as_ref().filter(|f| *f != &itf.name) {
-                            title.push_str(&format!("  ({f})"));
-                        }
-                        let header_color = if itf.is_default {
+                    let draw_iface = |ui: &mut egui::Ui, itf: &netconfig::IfaceInfo| {
+                        let dot = if itf.is_up {
+                            crate::theme::OK
+                        } else {
+                            crate::theme::DANGER
+                        };
+                        let name_color = if itf.is_default {
                             crate::theme::ORANGE
                         } else if !itf.is_up {
                             crate::theme::TEXT_MUTED
                         } else {
                             crate::theme::TEXT
                         };
-                        egui::CollapsingHeader::new(
-                            egui::RichText::new(title).color(header_color).size(15.0),
+                        let id = ui.make_persistent_id(format!("itf_{}", itf.name));
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            id,
+                            itf.is_up,
                         )
-                        .id_salt(format!("itf_{}", itf.name))
-                        .default_open(itf.is_default)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                if itf.is_up {
-                                    ui.colored_label(crate::theme::OK, "UP");
-                                } else {
-                                    ui.colored_label(crate::theme::DANGER, "DOWN");
-                                }
-                                if itf.is_default {
-                                    ui.colored_label(crate::theme::ORANGE, "• default route");
-                                }
-                                ui.weak(format!("• {}", itf.if_type));
-                            });
+                        .show_header(ui, |ui| {
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                            ui.painter().circle_filled(rect.center(), 4.5, dot);
+                            let mut title = itf.name.clone();
+                            if let Some(f) =
+                                itf.friendly_name.as_ref().filter(|f| *f != &itf.name)
+                            {
+                                title.push_str(&format!("  ({f})"));
+                            }
+                            ui.label(egui::RichText::new(title).color(name_color).size(15.0));
+                            if itf.is_default {
+                                ui.colored_label(crate::theme::ORANGE, "default route");
+                            }
+                        })
+                        .body(|ui| {
+                            ui.weak(&itf.if_type);
                             ui.add_space(2.0);
                             egui::Grid::new(format!("itf_grid_{}", itf.name))
                                 .num_columns(2)
@@ -1435,19 +1671,92 @@ impl RustyToolsApp {
                                     }
                                 });
                         });
+                    };
+
+                    let up: Vec<&netconfig::IfaceInfo> =
+                        report.interfaces.iter().filter(|i| i.is_up).collect();
+                    let down: Vec<&netconfig::IfaceInfo> =
+                        report.interfaces.iter().filter(|i| !i.is_up).collect();
+
+                    ui.heading(format!("Active interfaces ({})", up.len()));
+                    ui.add_space(4.0);
+                    for itf in &up {
+                        draw_iface(ui, itf);
+                    }
+                    if up.is_empty() {
+                        ui.weak("(none up)");
                     }
 
-                    ui.add_space(8.0);
-                    egui::CollapsingHeader::new("Routing table").default_open(true).show(
-                        ui,
-                        |ui| {
-                            ui.add(
-                                egui::TextEdit::multiline(&mut report.routes.as_str())
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(f32::INFINITY),
-                            );
-                        },
-                    );
+                    if !down.is_empty() {
+                        ui.add_space(12.0);
+                        ui.heading(
+                            egui::RichText::new(format!("Inactive interfaces ({})", down.len()))
+                                .color(crate::theme::TEXT_MUTED),
+                        );
+                        ui.add_space(4.0);
+                        for itf in &down {
+                            draw_iface(ui, itf);
+                        }
+                    }
+
+                    ui.add_space(12.0);
+                    ui.heading("Routing table");
+                    ui.add_space(4.0);
+                    if report.routes.is_empty() {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut report.routes_raw.as_str())
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY),
+                        );
+                    } else {
+                        let routes_grid =
+                            |ui: &mut egui::Ui, id: &str, rows: &[&netconfig::RouteEntry]| {
+                                egui::ScrollArea::horizontal().id_salt(id).show(ui, |ui| {
+                                    egui::Grid::new(format!("{id}_grid"))
+                                        .striped(true)
+                                        .spacing(egui::vec2(16.0, 5.0))
+                                        .show(ui, |ui| {
+                                            for h in
+                                                ["Destination", "Gateway", "Interface", "Info"]
+                                            {
+                                                ui.strong(h);
+                                            }
+                                            ui.end_row();
+                                            for r in rows {
+                                                ui.monospace(&r.destination);
+                                                ui.monospace(&r.gateway);
+                                                ui.label(&r.interface);
+                                                ui.weak(&r.info);
+                                                ui.end_row();
+                                            }
+                                        });
+                                });
+                            };
+                        let v4: Vec<&netconfig::RouteEntry> =
+                            report.routes.iter().filter(|r| !r.is_ipv6).collect();
+                        let v6: Vec<&netconfig::RouteEntry> =
+                            report.routes.iter().filter(|r| r.is_ipv6).collect();
+                        if !v4.is_empty() {
+                            ui.label(egui::RichText::new("IPv4").strong());
+                            routes_grid(ui, "routes_v4", &v4);
+                        }
+                        if !v6.is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("IPv6").strong());
+                            routes_grid(ui, "routes_v6", &v6);
+                        }
+                        ui.add_space(4.0);
+                        egui::CollapsingHeader::new("Raw output").default_open(false).show(
+                            ui,
+                            |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut report.routes_raw.as_str())
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            },
+                        );
+                    }
 
                     for (title, content) in &report.raw_sections {
                         egui::CollapsingHeader::new(format!("Raw output: {title}"))
@@ -1523,6 +1832,41 @@ impl RustyToolsApp {
                     }
                 }
             });
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Danger zone").color(crate::theme::DANGER).strong());
+            ui.weak("Delete every log file and the log folder itself.");
+            ui.add_space(4.0);
+            if self.delete_all_confirm {
+                ui.colored_label(
+                    crate::theme::DANGER,
+                    format!("Really delete {} and all its contents?", self.config.log_dir),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Yes, delete everything").clicked() {
+                        self.logs_message =
+                            Some(match util::delete_log_dir(&self.config.log_dir) {
+                                Ok(()) => "All logs and the log folder were deleted.".to_string(),
+                                Err(e) => e,
+                            });
+                        self.delete_all_confirm = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.delete_all_confirm = false;
+                    }
+                });
+            } else if ui.button("🗑 Delete all logs (and the folder)").clicked() {
+                self.delete_all_confirm = true;
+                self.logs_message = None;
+            }
+            if !self.delete_all_confirm {
+                if let Some(msg) = &self.logs_message {
+                    ui.add_space(4.0);
+                    ui.weak(msg.clone());
+                }
+            }
 
             ui.add_space(16.0);
             ui.separator();
@@ -1629,6 +1973,19 @@ impl RustyToolsApp {
 }
 
 impl eframe::App for RustyToolsApp {
+    /// Don't persist egui memory across runs (panel sizes, etc.) so the layout
+    /// always starts from our defined defaults — our own settings are saved
+    /// separately in settings.json.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
+    /// Clear to the window background so any uncovered sliver between panels
+    /// blends in instead of showing as a black bar.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        crate::theme::BG_WINDOW.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
 
@@ -1652,8 +2009,11 @@ impl eframe::App for RustyToolsApp {
             || self.trace_session.is_some()
             || self.dns_running
             || self.arp_vendor_running
+            || self.arp_scanning
         {
             ctx.request_repaint_after(Duration::from_millis(200));
+        } else if self.arp_auto || self.net_auto {
+            ctx.request_repaint_after(Duration::from_millis(750));
         }
     }
 }
