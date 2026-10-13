@@ -99,6 +99,7 @@ pub fn gather() -> NetReport {
     }
 
     let (routes, routes_raw) = gather_routes();
+    let raw_sections = raw_sections(&routes_raw);
     NetReport {
         generated_at: util::now_str(),
         hostname,
@@ -107,7 +108,7 @@ pub fn gather() -> NetReport {
         interfaces,
         routes,
         routes_raw,
-        raw_sections: raw_sections(),
+        raw_sections,
     }
 }
 
@@ -248,81 +249,71 @@ fn parse_routes_iproute(raw: &str) -> Vec<RouteEntry> {
     out
 }
 
-/// Parses the "Active Routes" IPv4 table of `route print` (Windows).
+/// Parses the active routes of `route print` (Windows). Rows are recognized
+/// by their shape, not by section titles: those are translated on a
+/// non-English system ("Itinéraires actifs", …).
 #[cfg(windows)]
 fn parse_routes_win(raw: &str) -> Vec<RouteEntry> {
+    let is_v4 = |s: &str| s.parse::<Ipv4Addr>().is_ok();
+    let is_num = |s: &str| s.parse::<u32>().is_ok();
     let mut out = Vec::new();
-    let mut in_active = false;
-    let mut is_v6 = false;
-    for line in raw.lines() {
-        let tl = line.trim();
-        if tl.starts_with("IPv4 Route Table") {
-            is_v6 = false;
-            in_active = false;
-            continue;
-        }
-        if tl.starts_with("IPv6 Route Table") {
-            is_v6 = true;
-            in_active = false;
-            continue;
-        }
-        if tl.starts_with("Active Routes:") {
-            in_active = true;
-            continue;
-        }
-        if !in_active {
-            continue;
-        }
-        // Column headers: "Network Destination ..." (v4) / "If Metric ..." (v6).
-        if tl.starts_with("Network Destination") || tl.starts_with("If ") {
-            continue;
-        }
-        if tl.starts_with('=') || tl.is_empty() || tl.starts_with("Persistent") {
-            in_active = false;
-            continue;
-        }
-        let t: Vec<&str> = tl.split_whitespace().collect();
-        if !is_v6 {
-            // Network Destination  Netmask  Gateway  Interface  Metric
-            if t.len() >= 5 && t[0].parse::<std::net::Ipv4Addr>().is_ok() {
-                out.push(RouteEntry {
-                    destination: format!("{} {}", t[0], t[1]),
-                    gateway: t[2].to_string(),
-                    interface: t[3].to_string(),
-                    info: format!("metric {}", t[4]),
-                    is_ipv6: false,
-                });
-            }
-        } else {
-            // If  Metric  Network Destination  Gateway
-            if t.len() >= 4 && t[0].parse::<u32>().is_ok() {
-                out.push(RouteEntry {
-                    destination: t[2].to_string(),
-                    gateway: t[3..].join(" "),
-                    interface: format!("if {}", t[0]),
-                    info: format!("metric {}", t[1]),
-                    is_ipv6: true,
-                });
-            }
+    let mut v6_seen = false;
+    let mut v6_done = false;
+    let mut lines = raw.lines();
+    while let Some(line) = lines.next() {
+        let t: Vec<&str> = line.split_whitespace().collect();
+        let n = t.len();
+        if n >= 5 && is_v4(t[0]) && is_v4(t[1]) && is_v4(t[n - 2]) && is_num(t[n - 1]) {
+            // Destination  Netmask  Gateway  Interface  Metric. Persistent
+            // routes have no Interface column, so they never match.
+            out.push(RouteEntry {
+                destination: format!("{} {}", t[0], t[1]),
+                gateway: t[2..n - 2].join(" "),
+                interface: t[n - 2].to_string(),
+                info: format!("metric {}", t[n - 1]),
+                is_ipv6: false,
+            });
+        } else if !v6_done && n >= 3 && is_num(t[0]) && is_num(t[1]) && t[2].contains(':') {
+            // If  Metric  Destination  Gateway. A long destination pushes
+            // the gateway to the next line.
+            let gateway = if n > 3 {
+                t[3..].join(" ")
+            } else {
+                lines.next().unwrap_or("").trim().to_string()
+            };
+            v6_seen = true;
+            out.push(RouteEntry {
+                destination: t[2].to_string(),
+                gateway,
+                interface: format!("if {}", t[0]),
+                info: format!("metric {}", t[1]),
+                is_ipv6: true,
+            });
+        } else if v6_seen && line.starts_with('=') {
+            // The separator after the active IPv6 rows: what follows is the
+            // persistent table, which has the same row shape.
+            v6_done = true;
         }
     }
     out
 }
 
-/// Raw output of the system tools, for verification or copy/paste.
-fn raw_sections() -> Vec<(String, String)> {
+/// Raw output of the system tools, for verification or copy/paste. The
+/// routing table output is reused rather than running the tool a second time.
+#[cfg_attr(all(unix, not(target_os = "macos")), allow(unused_variables))]
+fn raw_sections(routes_raw: &str) -> Vec<(String, String)> {
     #[cfg(windows)]
     {
         vec![
             ("ipconfig /all".to_string(), util::run_capture("ipconfig", &["/all"])),
-            ("route print".to_string(), util::run_capture("route", &["print"])),
+            ("route print".to_string(), routes_raw.to_string()),
         ]
     }
     #[cfg(target_os = "macos")]
     {
         vec![
             ("ifconfig -a".to_string(), util::run_capture("ifconfig", &["-a"])),
-            ("netstat -rn".to_string(), util::run_capture("netstat", &["-rn"])),
+            ("netstat -rn".to_string(), routes_raw.to_string()),
             ("scutil --dns".to_string(), util::run_capture("scutil", &["--dns"])),
         ]
     }
@@ -425,4 +416,85 @@ pub fn export(report: &NetReport, log_dir: &str) -> Result<PathBuf, String> {
     std::fs::write(&path, report_text(report))
         .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
     Ok(path)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    // Real `route print` output of a French Windows 11 (shortened).
+    const FRENCH: &str = "\
+IPv4 Table de routage
+===========================================================================
+Itinéraires actifs :
+Destination réseau    Masque réseau  Adr. passerelle   Adr. interface Métrique
+          0.0.0.0          0.0.0.0    192.168.1.254     192.168.1.36     40
+        127.0.0.0        255.0.0.0         On-link         127.0.0.1    331
+      192.168.2.0    255.255.255.0    192.168.1.210     192.168.1.36     21
+===========================================================================
+Itinéraires persistants :
+  Adresse réseau    Masque réseau  Adresse passerelle Métrique
+      192.168.2.0    255.255.255.0    192.168.1.210       1
+===========================================================================
+
+IPv6 Table de routage
+===========================================================================
+Itinéraires actifs :
+ If Metric Network Destination      Gateway
+ 11    276 ::/0                     fe80::3a07:16ff:fe1d:7d0
+  1    331 ::1/128                  On-link
+ 11    276 2a01:e0a:11b2:9590:203c:bb5a:4d36:9a4c/128
+                                    On-link
+===========================================================================
+Itinéraires persistants :
+  Aucun
+";
+
+    const ENGLISH: &str = "\
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0      192.168.1.1    192.168.1.10     25
+        127.0.0.0        255.0.0.0         On-link         127.0.0.1    331
+===========================================================================
+Persistent Routes:
+  None
+
+IPv6 Route Table
+===========================================================================
+Active Routes:
+ If Metric Network Destination      Gateway
+  1    331 ::1/128                  On-link
+===========================================================================
+Persistent Routes:
+ If Metric Network Destination      Gateway
+  0 4294967295 2001:db8::/32        fe80::1
+";
+
+    #[test]
+    fn route_print_french() {
+        let routes = parse_routes_win(FRENCH);
+        let v4: Vec<_> = routes.iter().filter(|r| !r.is_ipv6).collect();
+        let v6: Vec<_> = routes.iter().filter(|r| r.is_ipv6).collect();
+        // 3 active IPv4 routes; the persistent one is not repeated.
+        assert_eq!(v4.len(), 3);
+        assert_eq!(v4[0].gateway, "192.168.1.254");
+        assert_eq!(v4[0].interface, "192.168.1.36");
+        assert_eq!(v4[1].gateway, "On-link");
+        assert_eq!(v4[2].info, "metric 21");
+        assert_eq!(v6.len(), 3);
+        // Gateway wrapped onto the next line.
+        assert_eq!(v6[2].destination, "2a01:e0a:11b2:9590:203c:bb5a:4d36:9a4c/128");
+        assert_eq!(v6[2].gateway, "On-link");
+    }
+
+    #[test]
+    fn route_print_english_skips_persistent_ipv6() {
+        let routes = parse_routes_win(ENGLISH);
+        assert_eq!(routes.iter().filter(|r| !r.is_ipv6).count(), 2);
+        let v6: Vec<_> = routes.iter().filter(|r| r.is_ipv6).collect();
+        assert_eq!(v6.len(), 1);
+        assert_eq!(v6[0].destination, "::1/128");
+    }
 }

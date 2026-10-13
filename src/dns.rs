@@ -73,19 +73,13 @@ pub fn start(
         if use_system {
             match Resolver::from_system_conf() {
                 Ok(r) => servers.push(("system".to_string(), r)),
-                Err(e) => {
-                    let answer = DnsAnswer {
-                        timestamp: util::now_str(),
-                        query: "(resolver setup)".to_string(),
-                        rtype: rtype.clone(),
-                        server: "system".to_string(),
-                        records: Vec::new(),
-                        duration_ms: 0.0,
-                        error: Some(format!("cannot read system DNS configuration: {e}")),
-                    };
-                    log_answer(&mut file, &answer);
-                    let _ = tx.send(Event::Dns(DnsEvent::Answer(answer)));
-                }
+                Err(e) => setup_error(
+                    &mut file,
+                    &tx,
+                    &rtype,
+                    "system",
+                    format!("cannot read system DNS configuration: {e}"),
+                ),
             }
         }
         for ip in custom {
@@ -94,17 +88,7 @@ pub fn start(
             let bind_addr = match source.bind_ip_for(&ip) {
                 Ok(bind) => bind.map(|b| SocketAddr::new(b, 0)),
                 Err(e) => {
-                    let answer = DnsAnswer {
-                        timestamp: util::now_str(),
-                        query: "(resolver setup)".to_string(),
-                        rtype: rtype.clone(),
-                        server: ip.to_string(),
-                        records: Vec::new(),
-                        duration_ms: 0.0,
-                        error: Some(e),
-                    };
-                    log_answer(&mut file, &answer);
-                    let _ = tx.send(Event::Dns(DnsEvent::Answer(answer)));
+                    setup_error(&mut file, &tx, &rtype, &ip.to_string(), e);
                     continue;
                 }
             };
@@ -118,19 +102,7 @@ pub fn start(
             let config = ResolverConfig::from_parts(None, Vec::new(), group);
             match Resolver::new(config, opts.clone()) {
                 Ok(r) => servers.push((ip.to_string(), r)),
-                Err(e) => {
-                    let answer = DnsAnswer {
-                        timestamp: util::now_str(),
-                        query: "(resolver setup)".to_string(),
-                        rtype: rtype.clone(),
-                        server: ip.to_string(),
-                        records: Vec::new(),
-                        duration_ms: 0.0,
-                        error: Some(e.to_string()),
-                    };
-                    log_answer(&mut file, &answer);
-                    let _ = tx.send(Event::Dns(DnsEvent::Answer(answer)));
-                }
+                Err(e) => setup_error(&mut file, &tx, &rtype, &ip.to_string(), e.to_string()),
             }
         }
 
@@ -184,6 +156,21 @@ pub fn start(
     });
 
     Ok(path)
+}
+
+/// Logs and reports a resolver that could not be set up for `server`.
+fn setup_error(file: &mut File, tx: &Sender<Event>, rtype: &str, server: &str, error: String) {
+    let answer = DnsAnswer {
+        timestamp: util::now_str(),
+        query: "(resolver setup)".to_string(),
+        rtype: rtype.to_string(),
+        server: server.to_string(),
+        records: Vec::new(),
+        duration_ms: 0.0,
+        error: Some(error),
+    };
+    log_answer(file, &answer);
+    let _ = tx.send(Event::Dns(DnsEvent::Answer(answer)));
 }
 
 fn log_answer(file: &mut File, a: &DnsAnswer) {

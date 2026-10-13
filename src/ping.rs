@@ -23,6 +23,8 @@ pub struct PingEvent {
     pub seq: u64,
     pub status: PingStatus,
     pub timestamp: String,
+    /// When the probe was sent (x axis of the latency graph).
+    pub at: Instant,
 }
 
 pub struct PingSession {
@@ -96,21 +98,15 @@ fn worker(
                 seq: 0,
                 status: PingStatus::Error(e),
                 timestamp,
+                at: Instant::now(),
             }));
             return;
         }
     };
 
-    let mut backend = Backend::new(source);
-    let mut seq: u64 = 0;
     let mut prev_rtt: Option<Duration> = None;
-
-    while !stop.load(Ordering::SeqCst) {
-        seq += 1;
-        let started = Instant::now();
-        let result = backend.ping(ip, timeout, seq as u16);
+    probe_loop(ip, interval, timeout, source, &stop, |seq, at, result| {
         let timestamp = util::now_str();
-
         let status = match result {
             Ok(rtt) => {
                 let jitter = prev_rtt.map(|p| if rtt > p { rtt - p } else { p - rtt });
@@ -137,16 +133,38 @@ fn worker(
         let _ = writeln!(file, "{log_line}");
         let _ = file.flush();
 
-        let fatal = matches!(&status, PingStatus::Error(_));
         let _ = tx.send(Event::Ping(PingEvent {
             target: target.clone(),
             ip: Some(ip),
             seq,
             status,
             timestamp,
+            at,
         }));
-        // A socket error (permissions, network down) would repeat identically:
-        // stop this worker instead of spamming the log.
+    });
+}
+
+/// Probes `ip` every `interval` until `stop` is set, handing each result
+/// (sequence number, send time, outcome) to `on_result`. A fatal error
+/// (permissions, socket failure) would repeat identically, so the loop ends
+/// after reporting it instead of spamming the log.
+pub(crate) fn probe_loop(
+    ip: IpAddr,
+    interval: Duration,
+    timeout: Duration,
+    source: crate::util::SourceConfig,
+    stop: &AtomicBool,
+    mut on_result: impl FnMut(u64, Instant, Result<Duration, PingErr>),
+) {
+    let mut backend = Backend::new(source);
+    let mut seq: u64 = 0;
+
+    while !stop.load(Ordering::SeqCst) {
+        seq += 1;
+        let started = Instant::now();
+        let result = backend.ping(ip, timeout, seq as u16);
+        let fatal = matches!(result, Err(PingErr::Other(_)));
+        on_result(seq, started, result);
         if fatal {
             return;
         }
@@ -243,11 +261,19 @@ impl Backend {
             _ => pinger.send(ip, &mut buffer),
         };
         match result {
-            Ok(rtt_ms) => Ok(Duration::from_millis(rtt_ms as u64)),
+            // The API only reports whole milliseconds: use our own timer.
+            Ok(_) => Ok(started.elapsed()),
+            // Unreachable replies are loss, as on Unix: the worker must keep
+            // probing so the target is seen again when it comes back.
+            Err(
+                winping::Error::Timeout
+                | winping::Error::HostUnreachable
+                | winping::Error::NetUnreachable
+                | winping::Error::TtlExpired,
+            ) => Err(PingErr::Timeout),
             Err(e) => {
                 let msg = e.to_string();
-                // 11010 = IP_REQ_TIMED_OUT
-                if msg.contains("11010") || looks_like_timeout(&msg, started.elapsed(), timeout) {
+                if looks_like_timeout(&msg, started.elapsed(), timeout) {
                     Err(PingErr::Timeout)
                 } else {
                     Err(PingErr::Other(msg))

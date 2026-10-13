@@ -96,6 +96,10 @@ default behavior (system routing) is unchanged unless you opt in:
 - Every feature page has a **Delete log files** button (with confirmation)
   that empties its own log subfolder, plus a **Clear results** button for
   the current view
+- **Remove all traces and quit** (with confirmation): deletes the log files
+  written by RustyTools and its settings file, then closes the application.
+  Only files matching its own names are deleted and folders are removed only
+  when empty, so nothing else is ever touched
 
 ## Building
 

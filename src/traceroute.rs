@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::app::Event;
-use crate::ping::{Backend, PingErr};
+use crate::ping::PingErr;
 use crate::util;
 
 #[derive(Clone)]
@@ -166,10 +166,14 @@ fn target_worker(
             children.lock().unwrap().insert(worker_id, child);
 
             if let Some(stdout) = stdout {
-                for line in BufReader::new(stdout).lines() {
+                // split(), not lines(): lines() fails on the first non-UTF-8
+                // byte, and a localized tracert prints accented text.
+                for line in BufReader::new(stdout).split(b'\n') {
                     let Ok(line) = line else { break };
+                    let line = util::decode_console(&line);
+                    let line = line.trim_end();
                     let _ = writeln!(discovery_file, "[{}] {line}", util::now_str());
-                    if let Some((hop, ip)) = parse_hop_line(&line) {
+                    if let Some((hop, ip)) = parse_hop_line(line) {
                         let entry = hops.entry(hop).or_insert(None);
                         if entry.is_none() {
                             *entry = ip;
@@ -182,8 +186,10 @@ fn target_worker(
                 }
             }
             if let Some(stderr) = stderr {
-                for line in BufReader::new(stderr).lines() {
+                for line in BufReader::new(stderr).split(b'\n') {
                     let Ok(line) = line else { break };
+                    let line = util::decode_console(&line);
+                    let line = line.trim_end();
                     if !line.trim().is_empty() {
                         let _ = writeln!(discovery_file, "[{}] [stderr] {line}", util::now_str());
                     }
@@ -201,16 +207,21 @@ fn target_worker(
         return;
     }
 
-    let mut infos = build_hop_infos(&hops, target_ip);
-    if infos.is_empty() {
+    // Checked before build_hop_infos, which always appends the destination.
+    if hops.is_empty() {
         status("path discovery produced no hops (see discovery log)".to_string());
         return;
     }
+    let mut infos = build_hop_infos(&hops, target_ip);
 
     // --- Optional reverse DNS on each hop ---
     if params.resolve_names {
         status("resolving hop hostnames…".to_string());
         for info in &mut infos {
+            // Each lookup can block for seconds: let Stop cut the loop short.
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
             if let Some(ip) = info.ip {
                 info.hostname = dns_lookup::lookup_addr(&ip).ok().filter(|h| *h != ip.to_string());
             }
@@ -259,15 +270,8 @@ fn hop_worker(
     stop: Arc<AtomicBool>,
     tx: Sender<Event>,
 ) {
-    let mut backend = Backend::new(source);
-    let mut seq: u64 = 0;
-
-    while !stop.load(Ordering::SeqCst) {
-        seq += 1;
-        let started = Instant::now();
-        let result = backend.ping(ip, timeout, seq as u16);
+    crate::ping::probe_loop(ip, interval, timeout, source, &stop, |seq, _at, result| {
         let timestamp = util::now_str();
-
         let status = match result {
             Ok(rtt) => ProbeStatus::Ok { rtt },
             Err(PingErr::Timeout) => ProbeStatus::Timeout,
@@ -289,20 +293,8 @@ fn hop_worker(
             let _ = file.flush();
         }
 
-        let fatal = matches!(&status, ProbeStatus::Error(_));
         let _ = tx.send(Event::Trace(TraceEvent::Sample { target: target.clone(), hop, status }));
-        if fatal {
-            return;
-        }
-
-        loop {
-            let elapsed = started.elapsed();
-            if elapsed >= interval || stop.load(Ordering::SeqCst) {
-                break;
-            }
-            std::thread::sleep((interval - elapsed).min(Duration::from_millis(100)));
-        }
-    }
+    });
 }
 
 /// Turns the discovered hop map into an ordered list, making sure the final
@@ -433,4 +425,59 @@ fn traceroute_commands(
             vec!["-n".to_string(), "-m".to_string(), max_hops.to_string(), target.to_string()],
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(s: &str) -> Option<IpAddr> {
+        Some(s.parse().unwrap())
+    }
+
+    #[test]
+    fn hop_lines_across_tools_and_locales() {
+        // Windows tracert, English and French.
+        assert_eq!(
+            parse_hop_line("  1    <1 ms    <1 ms    <1 ms  192.168.1.254"),
+            Some((1, ip("192.168.1.254")))
+        );
+        assert_eq!(
+            parse_hop_line("  2     *        *        *     Délai d'attente de la demande dépassé."),
+            Some((2, None))
+        );
+        assert_eq!(
+            parse_hop_line("  1  192.168.1.254  rapports\u{a0}: Impossible de joindre l'hôte de destination."),
+            Some((1, ip("192.168.1.254")))
+        );
+        assert_eq!(
+            parse_hop_line("Détermination de l'itinéraire vers 8.8.8.8 avec un maximum de 30 sauts."),
+            None
+        );
+        // Unix traceroute and tracepath.
+        assert_eq!(parse_hop_line(" 3  10.0.0.1  1.2 ms  1.1 ms  1.0 ms"), Some((3, ip("10.0.0.1"))));
+        assert_eq!(parse_hop_line("traceroute to 8.8.8.8 (8.8.8.8), 30 hops max"), None);
+        assert_eq!(parse_hop_line(" 1:  192.168.1.1   0.5ms"), Some((1, ip("192.168.1.1"))));
+        assert_eq!(parse_hop_line(" 1?: [LOCALHOST]  pmtu 1500"), None);
+    }
+
+    #[test]
+    fn hop_list_ends_at_the_destination() {
+        let target: IpAddr = "8.8.8.8".parse().unwrap();
+        let mut hops = BTreeMap::new();
+        hops.insert(1, ip("192.168.1.254"));
+        hops.insert(2, None);
+
+        // Destination not reached: it is appended so it is still probed.
+        let infos = build_hop_infos(&hops, target);
+        assert_eq!(infos.len(), 3);
+        assert!(infos[2].is_destination && infos[2].hop == 3);
+
+        // Destination reached: anything printed after it is dropped.
+        hops.insert(3, Some(target));
+        hops.insert(4, ip("10.9.9.9"));
+        let infos = build_hop_infos(&hops, target);
+        assert_eq!(infos.len(), 3);
+        assert!(infos[2].is_destination);
+    }
 }

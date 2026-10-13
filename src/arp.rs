@@ -53,12 +53,15 @@ pub fn local_subnets() -> Vec<Subnet> {
             if hosts.is_empty() || hosts.len() > 1024 {
                 continue;
             }
-            let network = hosts[0];
+            // The first usable host is always the network address + 1.
+            let network = Ipv4Addr::from(u32::from(hosts[0]) - 1);
             if !seen.insert((network, prefix)) {
                 continue;
             }
+            // On Windows `name` is the adapter GUID; the friendly name is "Wi-Fi".
+            let name = itf.friendly_name.as_deref().unwrap_or(&itf.name);
             out.push(Subnet {
-                label: format!("{} — {}/{} ({} hosts)", itf.name, network, prefix, hosts.len()),
+                label: format!("{name} — {network}/{prefix} ({} hosts)", hosts.len()),
                 hosts,
             });
         }
@@ -302,6 +305,12 @@ fn gather_os() -> (Vec<ArpEntry>, String) {
 #[cfg(windows)]
 fn gather_os() -> (Vec<ArpEntry>, String) {
     let raw = util::run_capture("arp", &["-a"]);
+    (parse_win_arp(&raw), raw)
+}
+
+/// Parses `arp -a` (Windows).
+#[cfg(windows)]
+fn parse_win_arp(raw: &str) -> Vec<ArpEntry> {
     let mut entries = Vec::new();
     let mut iface = String::new();
     for line in raw.lines() {
@@ -325,7 +334,7 @@ fn gather_os() -> (Vec<ArpEntry>, String) {
             }
         }
     }
-    (entries, raw)
+    entries
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -373,6 +382,34 @@ mod tests {
         assert_eq!(normalize_mac("A4-2B-B0-11-22-33").as_deref(), Some("a4:2b:b0:11:22:33"));
         assert_eq!(normalize_mac("(incomplete)"), None);
         assert_eq!(oui_of("A4-2B-B0-11-22-33").as_deref(), Some("a4:2b:b0"));
+    }
+
+    #[test]
+    fn subnet_hosts_exclude_network_and_broadcast() {
+        let hosts = enumerate_hosts("192.168.1.36".parse().unwrap(), 24);
+        assert_eq!(hosts.len(), 254);
+        assert_eq!(hosts[0], Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(hosts[253], Ipv4Addr::new(192, 168, 1, 254));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win_arp_parsing() {
+        // French Windows: translated labels, non-breaking space before ':'.
+        let raw = "\nInterface\u{a0}: 192.168.1.36 --- 0xb\n\
+                   \x20 Adresse Internet      Adresse physique      Type\n\
+                   \x20 192.168.1.254         38-07-16-1d-07-d0     dynamique \n\
+                   \x20 192.168.1.255         ff-ff-ff-ff-ff-ff     statique  \n\
+                   \nInterface: 172.17.80.1 --- 0x16\n\
+                   \x20 Internet Address      Physical Address      Type\n\
+                   \x20 172.17.80.9           00-15-5d-01-02-03     dynamic\n";
+        let entries = parse_win_arp(raw);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].ip, "192.168.1.254");
+        assert_eq!(entries[0].mac, "38:07:16:1d:07:d0");
+        assert_eq!(entries[0].iface, "192.168.1.36");
+        assert_eq!(entries[0].state, "dynamique");
+        assert_eq!(entries[2].iface, "172.17.80.1");
     }
 
     #[cfg(unix)]
