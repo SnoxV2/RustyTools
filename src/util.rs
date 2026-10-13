@@ -121,12 +121,13 @@ pub fn clear_log_files(base: &str, sub: &str) -> Result<usize, String> {
 }
 
 /// The log files each feature writes: (subfolder, file name prefixes).
-const LOG_FILES: [(&str, &[&str]); 5] = [
+const LOG_FILES: [(&str, &[&str]); 6] = [
     ("ping", &["ping_"]),
     ("traceroute", &["discovery_", "mtr_"]),
     ("dns", &["dns_"]),
     ("arp", &["arp_"]),
     ("netconfig", &["netconfig_"]),
+    ("packet", &["packet_"]),
 ];
 
 /// Deletes the log files we wrote, then each subfolder and the log folder

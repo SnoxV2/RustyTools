@@ -49,6 +49,7 @@ impl RustyToolsApp {
                     ("traceroute", "🛣 Traceroute"),
                     ("dns", "🌐 DNS"),
                     ("arp", "📇 ARP"),
+                    ("packet", "📨 Packet sender"),
                     ("netconfig", "🖧 Network config"),
                 ] {
                     if ui.button(label).clicked() {
@@ -103,6 +104,7 @@ impl RustyToolsApp {
             // Running sessions keep their log files open, so they must end first.
             let busy = self.ping_session.as_ref().is_some_and(|s| s.is_running())
                 || self.trace_session.as_ref().is_some_and(|s| s.is_running())
+                || self.packet_session.as_ref().is_some_and(|s| s.is_running())
                 || self.dns_running
                 || self.arp_scanning
                 || self.arp_vendor_running;

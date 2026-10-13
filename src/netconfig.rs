@@ -89,7 +89,9 @@ pub fn gather() -> NetReport {
         });
     }
     // Default and active interfaces first.
-    interfaces.sort_by_key(|i| (!i.is_default, !i.is_up, i.name.clone()));
+    interfaces.sort_by_key(|i| {
+        (!i.is_default, !i.is_up, i.friendly_name.clone().unwrap_or_else(|| i.name.clone()))
+    });
 
     let (domain, mut extra_dns) = domain_and_dns();
     for d in extra_dns.drain(..) {

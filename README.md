@@ -10,8 +10,8 @@ application (egui), cross-platform: **Windows, macOS, Linux**.
 - Visual identity: the "R" signal-tile logo (Zilla Slab on an orange tile with
   engraved signal rings) is drawn as a vector at runtime and reused as the
   window/dock icon.
-- Left navigation rail with one entry per page; collapses to icons only on a
-  narrow window. Layouts and side panels are resizable/responsive.
+- Fixed left navigation menu with one entry (icon + label) per page. Layouts
+  and side panels are resizable/responsive.
 - Each page has buttons to open or clear its log subfolder; Settings has direct
   shortcuts to every subfolder.
 
@@ -79,6 +79,15 @@ default behavior (system routing) is unchanged unless you opt in:
 - Optional **auto-refresh** every 3 s (checkbox)
 - Table export (with vendors) to `logs/arp/`
 
+### 📨 Packet sender
+- Send **UDP** datagrams or open **TCP** connections to a destination and
+  port, with an optional text payload, a packet count and an interval
+- **Source selection**: pick the source interface or a custom source IP; the
+  log shows the local address and port really used
+- Each line reports the outcome: reply size and preview, no reply, TCP
+  connect time, connection refused / timed out
+- One timestamped log file per run in `logs/packet/`
+
 ### 🖧 Network configuration
 - Hostname, DNS domain, DNS servers
 - Interfaces: state (UP/DOWN), type, MAC, IPv4 + mask, IPv6, gateway, DNS,
@@ -91,8 +100,8 @@ default behavior (system routing) is unchanged unless you opt in:
 - Log folder, selected with the native folder picker
 - Settings (log folder, intervals, timeouts, hop limit, …) are saved
   automatically in the platform config directory and persist across restarts
-- The `ping/`, `traceroute/`, `dns/`, `arp/` and `netconfig/` subfolders are
-  created automatically inside the log folder
+- The `ping/`, `traceroute/`, `dns/`, `arp/`, `packet/` and `netconfig/`
+  subfolders are created automatically inside the log folder
 - Every feature page has a **Delete log files** button (with confirmation)
   that empties its own log subfolder, plus a **Clear results** button for
   the current view
@@ -133,7 +142,7 @@ If neither mode is available, the error is shown in the UI with the fix.
 
 All files are written under the log folder configured in Settings
 (`Documents/RustyTools/logs` by default), in the `ping/`, `traceroute/`,
-`dns/`, `arp/` and `netconfig/` subfolders. Every line is timestamped with
+`dns/`, `arp/`, `packet/` and `netconfig/` subfolders. Every line is timestamped with
 millisecond precision.
 
 ## Credits

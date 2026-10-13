@@ -9,6 +9,7 @@ mod dns;
 mod icmp;
 mod logo;
 mod netconfig;
+mod packet;
 mod ping;
 mod settings;
 mod theme;

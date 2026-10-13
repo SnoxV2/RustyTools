@@ -10,6 +10,7 @@ use egui_plot::{Legend, Line, MarkerShape, Plot, PlotPoints, Points};
 use crate::arp::{self, ArpEntry, ArpEvent};
 use crate::dns::{self, DnsAnswer, DnsEvent};
 use crate::netconfig::{self, NetReport};
+use crate::packet::{self, PacketParams, PacketSession, Proto};
 use crate::ping::{self, PingSession, PingStatus};
 use crate::settings::{self, AppConfig};
 use crate::traceroute::{self, HopInfo, ProbeStatus, TraceParams, TraceSession};
@@ -18,6 +19,7 @@ use crate::util;
 mod arp_tab;
 mod dns_tab;
 mod netconfig_tab;
+mod packet_tab;
 mod ping_tab;
 mod settings_tab;
 mod trace_tab;
@@ -27,6 +29,8 @@ pub enum Event {
     Trace(traceroute::TraceEvent),
     Dns(DnsEvent),
     Arp(ArpEvent),
+    /// One result line of the packet sender.
+    Packet(String),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -35,6 +39,7 @@ enum Tab {
     Traceroute,
     Dns,
     Arp,
+    Packet,
     NetConfig,
     Settings,
 }
@@ -271,6 +276,17 @@ pub struct RustyToolsApp {
     arp_scanning: bool,
     arp_scan: Option<(usize, usize, usize)>,
 
+    // Packet sender
+    packet_target: String,
+    packet_port: u16,
+    packet_proto: Proto,
+    packet_payload: String,
+    packet_count: u32,
+    packet_interval_s: f32,
+    packet_session: Option<PacketSession>,
+    packet_log: VecDeque<String>,
+    packet_error: Option<String>,
+
     // Network configuration
     net_report: Option<NetReport>,
     net_message: Option<String>,
@@ -286,11 +302,10 @@ pub struct RustyToolsApp {
     ping_source: SourceUi,
     trace_source: SourceUi,
     dns_source: SourceUi,
+    packet_source: SourceUi,
 
     // Logo texture, built once from the rendered RGBA buffer.
     logo_tex: Option<egui::TextureHandle>,
-    // Nav rail expands on hover, collapses to icons otherwise.
-    nav_hovered: bool,
     // Settings "delete everything" two-step confirmation.
     delete_all_confirm: bool,
     // Settings "quit and remove all traces" two-step confirmation.
@@ -345,6 +360,15 @@ impl RustyToolsApp {
             arp_subnet_sel: 0,
             arp_scanning: false,
             arp_scan: None,
+            packet_target: String::new(),
+            packet_port: 80,
+            packet_proto: Proto::Udp,
+            packet_payload: String::new(),
+            packet_count: 1,
+            packet_interval_s: 1.0,
+            packet_session: None,
+            packet_log: VecDeque::new(),
+            packet_error: None,
             net_report: None,
             net_message: None,
             net_auto: false,
@@ -355,8 +379,8 @@ impl RustyToolsApp {
             ping_source: SourceUi::default(),
             trace_source: SourceUi::default(),
             dns_source: SourceUi::default(),
+            packet_source: SourceUi::default(),
             logo_tex,
-            nav_hovered: false,
             delete_all_confirm: false,
             wipe_confirm: false,
         }
@@ -364,11 +388,16 @@ impl RustyToolsApp {
 
     /// "Advanced" section shared by the feature tabs (source selection).
     fn advanced_source_ui(&mut self, ui: &mut egui::Ui, id: &str, which: Tab, enabled: bool) {
-        egui::CollapsingHeader::new("Advanced").id_salt(format!("{id}_adv")).show(ui, |ui| {
+        egui::CollapsingHeader::new("Advanced")
+            .id_salt(format!("{id}_adv"))
+            // Choosing the source is the point of the packet page.
+            .default_open(which == Tab::Packet)
+            .show(ui, |ui| {
             ui.add_enabled_ui(enabled, |ui| {
                 let src = match which {
                     Tab::Ping => &mut self.ping_source,
                     Tab::Traceroute => &mut self.trace_source,
+                    Tab::Packet => &mut self.packet_source,
                     _ => &mut self.dns_source,
                 };
                 source_selector(ui, id, src, &self.ifaces);
@@ -377,9 +406,12 @@ impl RustyToolsApp {
                 }
                 if ui.small_button("🔄 Refresh interface list").clicked() {
                     self.ifaces = gather_ifaces();
-                    for src in
-                        [&mut self.ping_source, &mut self.trace_source, &mut self.dns_source]
-                    {
+                    for src in [
+                        &mut self.ping_source,
+                        &mut self.trace_source,
+                        &mut self.dns_source,
+                        &mut self.packet_source,
+                    ] {
                         if matches!(src.sel, SourceSel::Iface(i) if i >= self.ifaces.len()) {
                             src.sel = SourceSel::Default;
                         }
@@ -396,6 +428,7 @@ impl RustyToolsApp {
                 Event::Trace(ev) => self.on_trace_event(ev),
                 Event::Dns(DnsEvent::Answer(answer)) => self.dns_results.push(answer),
                 Event::Dns(DnsEvent::Done) => self.dns_running = false,
+                Event::Packet(line) => push_capped(&mut self.packet_log, line, 2000),
                 Event::Arp(ArpEvent::Vendor { oui, vendor }) => {
                     self.arp_vendors.insert(oui, vendor);
                 }
@@ -474,8 +507,8 @@ impl RustyToolsApp {
 }
 
 impl RustyToolsApp {
-    /// Logo + one nav row per page. `compact` shows icons only.
-    fn nav_contents(&mut self, ui: &mut egui::Ui, compact: bool) {
+    /// Logo + one nav row per page.
+    fn nav_contents(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if let Some(tex) = &self.logo_tex {
@@ -484,14 +517,12 @@ impl RustyToolsApp {
                     egui::vec2(30.0, 30.0),
                 )));
             }
-            if !compact {
-                ui.label(
-                    egui::RichText::new("RustyTools")
-                        .family(egui::FontFamily::Name(crate::theme::ZILLA_BOLD.into()))
-                        .size(19.0)
-                        .color(crate::theme::TEXT),
-                );
-            }
+            ui.label(
+                egui::RichText::new("RustyTools")
+                    .family(egui::FontFamily::Name(crate::theme::ZILLA_BOLD.into()))
+                    .size(19.0)
+                    .color(crate::theme::TEXT),
+            );
         });
         ui.add_space(10.0);
         ui.separator();
@@ -502,61 +533,32 @@ impl RustyToolsApp {
             (Tab::Traceroute, "\u{1F5FA}", "Traceroute"),
             (Tab::Dns, "🌐", "DNS"),
             (Tab::Arp, "📇", "ARP"),
+            (Tab::Packet, "📨", "Packet sender"),
             (Tab::NetConfig, "🖧", "Network config"),
             (Tab::Settings, "⚙", "Settings"),
         ];
         for (tab, icon, label) in items {
-            let text = if compact { icon.to_string() } else { format!("{icon}  {label}") };
             let resp = ui.add_sized(
                 [ui.available_width(), 34.0],
-                egui::SelectableLabel::new(self.tab == tab, text),
+                egui::SelectableLabel::new(self.tab == tab, format!("{icon}  {label}")),
             );
-            if compact {
-                resp.clone().on_hover_text(label);
-            }
             if resp.clicked() {
                 self.tab = tab;
             }
         }
     }
 
-    /// A persistent icon-only rail that reserves layout space; on hover an
-    /// expanded version with labels floats OVER the content (no reflow).
+    /// Fixed navigation menu, always expanded (icons + labels).
     fn nav_rail(&mut self, ctx: &egui::Context) {
-        let panel = egui::SidePanel::left("nav_rail")
-            .exact_width(58.0)
+        egui::SidePanel::left("nav_rail")
+            .exact_width(182.0)
             .resizable(false)
             .frame(
                 egui::Frame::default()
                     .fill(crate::theme::BG_SURFACE)
                     .inner_margin(egui::Margin::same(8)),
             )
-            .show(ctx, |ui| self.nav_contents(ui, true));
-        let rect = panel.response.rect;
-        let mut hovered = panel.response.contains_pointer();
-
-        if self.nav_hovered {
-            let area = egui::Area::new(egui::Id::new("nav_overlay"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(rect.left_top())
-                .show(ctx, |ui| {
-                    egui::Frame::default()
-                        .fill(crate::theme::BG_SURFACE)
-                        .stroke(egui::Stroke::new(1.0, crate::theme::BORDER))
-                        .inner_margin(egui::Margin::same(8))
-                        .show(ui, |ui| {
-                            ui.set_width(166.0);
-                            ui.set_min_height(rect.height() - 16.0);
-                            self.nav_contents(ui, false);
-                        });
-                });
-            hovered |= area.response.contains_pointer();
-        }
-
-        if hovered != self.nav_hovered {
-            self.nav_hovered = hovered;
-            ctx.request_repaint();
-        }
+            .show(ctx, |ui| self.nav_contents(ui));
     }
 }
 
@@ -584,6 +586,7 @@ impl eframe::App for RustyToolsApp {
             Tab::Traceroute => self.ui_trace(ctx),
             Tab::Dns => self.ui_dns(ctx),
             Tab::Arp => self.ui_arp(ctx),
+            Tab::Packet => self.ui_packet(ctx),
             Tab::NetConfig => self.ui_netconfig(ctx),
             Tab::Settings => self.ui_settings(ctx),
         }
@@ -598,6 +601,7 @@ impl eframe::App for RustyToolsApp {
             || self.dns_running
             || self.arp_vendor_running
             || self.arp_scanning
+            || self.packet_session.as_ref().is_some_and(|s| s.is_running())
         {
             ctx.request_repaint_after(Duration::from_millis(200));
         } else if self.arp_auto || self.net_auto {

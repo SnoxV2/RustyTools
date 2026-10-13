@@ -75,13 +75,17 @@ impl RustyToolsApp {
                             key(ui, "Domain");
                             ui.label(report.domain.as_deref().unwrap_or("(none)"));
                             ui.end_row();
-                            key(ui, "DNS servers");
                             if report.dns_servers.is_empty() {
+                                key(ui, "DNS servers");
                                 ui.weak("(none detected)");
-                            } else {
-                                ui.monospace(report.dns_servers.join(", "));
+                                ui.end_row();
                             }
-                            ui.end_row();
+                            // One per row: a joined list runs off the window.
+                            for (i, server) in report.dns_servers.iter().enumerate() {
+                                key(ui, if i == 0 { "DNS servers" } else { "" });
+                                ui.monospace(server);
+                                ui.end_row();
+                            }
                             key(ui, "Generated");
                             ui.weak(&report.generated_at);
                             ui.end_row();
@@ -111,22 +115,24 @@ impl RustyToolsApp {
                             let (rect, _) =
                                 ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                             ui.painter().circle_filled(rect.center(), 4.5, dot);
-                            let mut title = itf.name.clone();
-                            if let Some(f) =
-                                itf.friendly_name.as_ref().filter(|f| *f != &itf.name)
-                            {
-                                title.push_str(&format!("  ({f})"));
-                            }
+                            // On Windows `name` is the adapter GUID: the readable
+                            // name is the title, the GUID goes to the body.
+                            let title = itf.friendly_name.as_deref().unwrap_or(&itf.name);
                             ui.label(egui::RichText::new(title).color(name_color).size(15.0));
                             if itf.is_default {
                                 ui.colored_label(crate::theme::ORANGE, "default route");
                             }
                         })
                         .body(|ui| {
-                            ui.weak(&itf.if_type);
+                            match itf.friendly_name.as_ref().filter(|f| *f != &itf.name) {
+                                Some(_) => ui.weak(format!("{} · {}", itf.if_type, itf.name)),
+                                None => ui.weak(&itf.if_type),
+                            };
                             ui.add_space(2.0);
                             egui::Grid::new(format!("itf_grid_{}", itf.name))
                                 .num_columns(2)
+                                // Same label column on every interface so values line up.
+                                .min_col_width(60.0)
                                 .spacing(egui::vec2(18.0, 5.0))
                                 .show(ui, |ui| {
                                     let key = |ui: &mut egui::Ui, k: &str| {
@@ -152,9 +158,9 @@ impl RustyToolsApp {
                                         ui.monospace(gw);
                                         ui.end_row();
                                     }
-                                    if !itf.dns.is_empty() {
+                                    for server in &itf.dns {
                                         key(ui, "DNS");
-                                        ui.monospace(itf.dns.join(", "));
+                                        ui.monospace(server);
                                         ui.end_row();
                                     }
                                 });

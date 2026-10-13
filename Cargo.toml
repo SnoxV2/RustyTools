@@ -19,8 +19,6 @@ directories = "6"
 dns-lookup = "2"
 hickory-resolver = "0.24"
 mac_oui = { version = "0.4", features = ["with-db"] }
-
-[target.'cfg(unix)'.dependencies]
 socket2 = { version = "0.5", features = ["all"] }
 
 [target.'cfg(windows)'.dependencies]
