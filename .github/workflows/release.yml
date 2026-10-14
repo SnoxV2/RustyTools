@@ -1,0 +1,63 @@
+# Pushing a tag like v1.0.0 builds Windows and macOS binaries and publishes
+# them as a GitHub release. The release notes are the annotated tag message.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (Windows x86_64)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release --locked
+          Compress-Archive -Path target/release/rustytools.exe -DestinationPath "rustytools-${{ github.ref_name }}-windows-x86_64.zip"
+
+      # One binary for both Apple Silicon and Intel Macs.
+      - name: Build (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          lipo -create -output rustytools \
+            target/aarch64-apple-darwin/release/rustytools \
+            target/x86_64-apple-darwin/release/rustytools
+          zip "rustytools-${{ github.ref_name }}-macos-universal.zip" rustytools
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.os }}
+          path: rustytools-*.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # checkout@v4 fetches the tag as a lightweight ref: re-fetch the
+          # annotated tag so --notes-from-tag can read its message.
+          git fetch --force origin "refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}"
+          gh release create "${{ github.ref_name }}" dist/*.zip \
+            --title "RustyTools ${{ github.ref_name }}" --notes-from-tag
