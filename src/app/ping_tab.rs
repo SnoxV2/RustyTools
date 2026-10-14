@@ -178,7 +178,7 @@ impl RustyToolsApp {
             }
 
             ui.add_space(10.0);
-            if ui.button("🧹 Clear results").clicked() {
+            if ui.button("✖ Clear results").clicked() {
                 for state in &mut self.ping_targets_state {
                     state.stats = Stats::default();
                     state.samples.clear();

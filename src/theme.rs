@@ -28,6 +28,9 @@ pub const OK: Color32 = Color32::from_rgb(0x7B, 0xC4, 0x8A);
 pub const WARN: Color32 = Color32::from_rgb(0xE7, 0xB4, 0x5A);
 pub const DANGER: Color32 = Color32::from_rgb(0xE5, 0x73, 0x73);
 
+/// Inner padding of every text field (egui's default 4 × 2 px hugs the border).
+pub const TEXT_EDIT_MARGIN: egui::Margin = egui::Margin::symmetric(8, 5);
+
 pub const ZILLA: &str = "zilla";
 pub const ZILLA_BOLD: &str = "zilla-bold";
 

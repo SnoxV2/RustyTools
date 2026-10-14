@@ -124,7 +124,7 @@ impl RustyToolsApp {
             }
 
             ui.add_space(10.0);
-            if ui.button("🧹 Clear results").clicked() {
+            if ui.button("✖ Clear results").clicked() {
                 self.dns_results.clear();
             }
             self.delete_logs_ui(ui, "dns", !self.dns_running);

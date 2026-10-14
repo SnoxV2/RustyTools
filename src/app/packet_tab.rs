@@ -42,8 +42,9 @@ impl RustyToolsApp {
                 ui.label("Destination (IP or FQDN):");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.packet_target)
+                        .margin(crate::theme::TEXT_EDIT_MARGIN)
                         .desired_width(f32::INFINITY)
-                        .hint_text("192.168.1.10"),
+                        .hint_text(egui::RichText::new("192.168.1.10").color(crate::theme::HINT)),
                 );
                 ui.add_space(6.0);
                 egui::Grid::new("packet_params").num_columns(2).show(ui, |ui| {
@@ -100,7 +101,7 @@ impl RustyToolsApp {
             }
 
             ui.add_space(10.0);
-            if ui.button("🧹 Clear results").clicked() {
+            if ui.button("✖ Clear results").clicked() {
                 self.packet_log.clear();
             }
             self.delete_logs_ui(ui, "packet", !running);

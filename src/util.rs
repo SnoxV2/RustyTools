@@ -49,6 +49,12 @@ pub fn ensure_log_dir(base: &str, sub: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// The token right after `key` in a whitespace-split line of tool output.
+#[cfg(unix)]
+pub fn token_after<'a>(tokens: &[&'a str], key: &str) -> Option<&'a str> {
+    tokens.iter().position(|t| *t == key).and_then(|i| tokens.get(i + 1)).copied()
+}
+
 /// Optional probe source: a specific local IP and/or a network interface.
 /// Default (both None) keeps the OS routing behavior.
 #[derive(Clone, Default)]
@@ -99,8 +105,9 @@ impl SourceConfig {
     }
 }
 
-/// Deletes every file in `<base>/<sub>` (subfolders untouched).
-/// Returns the number of deleted files; a missing folder counts as 0.
+/// Deletes the log files we wrote in `<base>/<sub>` (other files and
+/// subfolders untouched). Returns the number of deleted files; a missing
+/// folder counts as 0.
 pub fn clear_log_files(base: &str, sub: &str) -> Result<usize, String> {
     let dir = PathBuf::from(if base.trim().is_empty() { "logs" } else { base.trim() }).join(sub);
     let entries = match std::fs::read_dir(&dir) {
@@ -111,7 +118,7 @@ pub fn clear_log_files(base: &str, sub: &str) -> Result<usize, String> {
     let mut deleted = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() {
+        if path.is_file() && is_our_log(sub, &entry.file_name().to_string_lossy()) {
             std::fs::remove_file(&path)
                 .map_err(|e| format!("cannot delete {}: {e}", path.display()))?;
             deleted += 1;
@@ -130,27 +137,27 @@ const LOG_FILES: [(&str, &[&str]); 6] = [
     ("packet", &["packet_"]),
 ];
 
+/// Whether `name` is a log file we write in the `sub` log subfolder. The log
+/// folder is user-chosen, so nothing else may ever be deleted from it.
+fn is_our_log(sub: &str, name: &str) -> bool {
+    let prefix_ok = LOG_FILES
+        .iter()
+        .filter(|(s, _)| *s == sub)
+        .any(|(_, prefixes)| prefixes.iter().any(|p| name.starts_with(p)));
+    prefix_ok
+        && matches!(Path::new(name).extension().and_then(|e| e.to_str()), Some("csv" | "log" | "txt"))
+}
+
 /// Deletes the log files we wrote, then each subfolder and the log folder
 /// itself if nothing else is left in them. The folder is user-chosen (it
 /// could be Documents), so only files matching our own names are removed and
 /// folders are only ever removed empty. A missing folder is treated as success.
 pub fn delete_log_dir(base: &str) -> Result<(), String> {
     let dir = PathBuf::from(if base.trim().is_empty() { "logs" } else { base.trim() });
-    for (sub, prefixes) in LOG_FILES {
-        let sub_dir = dir.join(sub);
-        let Ok(entries) = std::fs::read_dir(&sub_dir) else { continue };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let ours = prefixes.iter().any(|p| name.starts_with(p))
-                && matches!(path.extension().and_then(|e| e.to_str()), Some("csv" | "log" | "txt"));
-            if ours && path.is_file() {
-                std::fs::remove_file(&path)
-                    .map_err(|e| format!("cannot delete {}: {e}", path.display()))?;
-            }
-        }
+    for (sub, _) in LOG_FILES {
+        clear_log_files(base, sub)?;
         // Non-recursive on purpose: fails (and is ignored) when other files remain.
-        let _ = std::fs::remove_dir(&sub_dir);
+        let _ = std::fs::remove_dir(dir.join(sub));
     }
     let _ = std::fs::remove_dir(&dir);
     Ok(())
@@ -238,6 +245,21 @@ pub fn open_in_file_manager(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_log_files_keeps_foreign_files() {
+        let base = std::env::temp_dir().join(format!("rustytools_clear_{}", std::process::id()));
+        std::fs::create_dir_all(base.join("dns")).unwrap();
+        std::fs::write(base.join("dns").join("dns_20260101.log"), "x").unwrap();
+        std::fs::write(base.join("dns").join("zones.txt"), "mine").unwrap();
+        // Another feature's prefix is not ours in this subfolder.
+        std::fs::write(base.join("dns").join("ping_x.csv"), "mine").unwrap();
+
+        assert_eq!(clear_log_files(base.to_str().unwrap(), "dns").unwrap(), 1);
+        assert!(base.join("dns").join("zones.txt").exists());
+        assert!(base.join("dns").join("ping_x.csv").exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn delete_log_dir_keeps_foreign_files() {

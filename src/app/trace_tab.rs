@@ -43,7 +43,7 @@ impl RustyToolsApp {
                         ProbeStatus::Ok { rtt } => {
                             let jitter = row
                                 .prev_rtt
-                                .map(|p| if rtt > p { rtt - p } else { p - rtt });
+                                .map(|p| rtt.abs_diff(p));
                             row.prev_rtt = Some(rtt);
                             row.stats.record_ok(rtt, jitter);
                         }
@@ -189,7 +189,7 @@ impl RustyToolsApp {
 
             ui.add_space(10.0);
             if ui
-                .add_enabled(!running, egui::Button::new("🧹 Clear results"))
+                .add_enabled(!running, egui::Button::new("✖ Clear results"))
                 .on_disabled_hover_text("Stop the running session first")
                 .clicked()
             {

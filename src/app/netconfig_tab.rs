@@ -3,12 +3,24 @@
 use super::*;
 
 impl RustyToolsApp {
+    /// Gathers the report in a background thread: the system tools take
+    /// ~100 ms, which would freeze the window on every refresh.
+    fn refresh_netconfig(&mut self) {
+        if self.net_loading {
+            return;
+        }
+        self.net_loading = true;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Event::NetConfig(netconfig::gather()));
+        });
+    }
+
     pub(super) fn ui_netconfig(&mut self, ctx: &egui::Context) {
         if self.net_report.is_none()
             || (self.net_auto && self.net_last_refresh.elapsed() >= Duration::from_secs(3))
         {
-            self.net_report = Some(netconfig::gather());
-            self.net_last_refresh = Instant::now();
+            self.refresh_netconfig();
         }
 
         egui::SidePanel::left("net_side")
@@ -23,9 +35,8 @@ impl RustyToolsApp {
                     .add_sized([ui.available_width(), 30.0], egui::Button::new("🔄 Refresh"))
                     .clicked()
                 {
-                    self.net_report = Some(netconfig::gather());
+                    self.refresh_netconfig();
                     self.net_message = None;
-                    self.net_last_refresh = Instant::now();
                 }
                 if ui.checkbox(&mut self.net_auto, "Auto-refresh (3 s)").changed() {
                     self.net_last_refresh = Instant::now();
@@ -199,6 +210,7 @@ impl RustyToolsApp {
                     if report.routes.is_empty() {
                         ui.add(
                             egui::TextEdit::multiline(&mut report.routes_raw.as_str())
+                                .margin(crate::theme::TEXT_EDIT_MARGIN)
                                 .font(egui::TextStyle::Monospace)
                                 .desired_width(f32::INFINITY),
                         );
@@ -245,6 +257,7 @@ impl RustyToolsApp {
                             |ui| {
                                 ui.add(
                                     egui::TextEdit::multiline(&mut report.routes_raw.as_str())
+                                        .margin(crate::theme::TEXT_EDIT_MARGIN)
                                         .font(egui::TextStyle::Monospace)
                                         .desired_width(f32::INFINITY),
                                 );
@@ -258,6 +271,7 @@ impl RustyToolsApp {
                             .show(ui, |ui| {
                                 ui.add(
                                     egui::TextEdit::multiline(&mut content.as_str())
+                                        .margin(crate::theme::TEXT_EDIT_MARGIN)
                                         .font(egui::TextStyle::Monospace)
                                         .desired_width(f32::INFINITY),
                                 );

@@ -4,6 +4,14 @@ use super::*;
 
 impl RustyToolsApp {
     pub(super) fn ui_settings(&mut self, ctx: &egui::Context) {
+        // Running sessions keep their log files open, so deleting logs must
+        // wait for them to end.
+        let busy = self.ping_session.as_ref().is_some_and(|s| s.is_running())
+            || self.trace_session.as_ref().is_some_and(|s| s.is_running())
+            || self.packet_session.as_ref().is_some_and(|s| s.is_running())
+            || self.dns_running
+            || self.arp_scanning
+            || self.arp_vendor_running;
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(4.0);
             ui.heading("Settings");
@@ -14,6 +22,7 @@ impl RustyToolsApp {
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut self.config.log_dir)
+                            .margin(crate::theme::TEXT_EDIT_MARGIN)
                             .desired_width(420.0),
                     )
                     .changed()
@@ -46,7 +55,7 @@ impl RustyToolsApp {
             ui.horizontal_wrapped(|ui| {
                 for (sub, label) in [
                     ("ping", "📡 Ping"),
-                    ("traceroute", "🛣 Traceroute"),
+                    ("traceroute", "\u{1F5FA} Traceroute"),
                     ("dns", "🌐 DNS"),
                     ("arp", "📇 ARP"),
                     ("packet", "📨 Packet sender"),
@@ -85,7 +94,11 @@ impl RustyToolsApp {
                         self.delete_all_confirm = false;
                     }
                 });
-            } else if ui.button("🗑 Delete all logs").clicked() {
+            } else if ui
+                .add_enabled(!busy, egui::Button::new("🗑 Delete all logs"))
+                .on_disabled_hover_text("Stop the running sessions first")
+                .clicked()
+            {
                 self.delete_all_confirm = true;
                 self.logs_message = None;
             }
@@ -98,16 +111,10 @@ impl RustyToolsApp {
 
             ui.add_space(12.0);
             ui.weak(
-                "Quit and leave nothing on this computer: deletes the log files written by                  RustyTools and its settings file. Other files are never touched.",
+                "Quit and leave nothing on this computer: deletes the log files written by \
+                 RustyTools and its settings file. Other files are never touched.",
             );
             ui.add_space(4.0);
-            // Running sessions keep their log files open, so they must end first.
-            let busy = self.ping_session.as_ref().is_some_and(|s| s.is_running())
-                || self.trace_session.as_ref().is_some_and(|s| s.is_running())
-                || self.packet_session.as_ref().is_some_and(|s| s.is_running())
-                || self.dns_running
-                || self.arp_scanning
-                || self.arp_vendor_running;
             if self.wipe_confirm {
                 ui.colored_label(
                     crate::theme::DANGER,
@@ -134,7 +141,7 @@ impl RustyToolsApp {
                     }
                 });
             } else if ui
-                .add_enabled(!busy, egui::Button::new("🧹 Remove all traces and quit"))
+                .add_enabled(!busy, egui::Button::new("🔥 Remove all traces and quit"))
                 .on_disabled_hover_text("Stop the running sessions first")
                 .clicked()
             {

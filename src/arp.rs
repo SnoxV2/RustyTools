@@ -348,10 +348,7 @@ fn gather_os() -> (Vec<ArpEntry>, String) {
             if tokens.is_empty() || tokens[0].parse::<IpAddr>().is_err() {
                 continue;
             }
-            let after = |key: &str| {
-                tokens.iter().position(|t| *t == key).and_then(|i| tokens.get(i + 1)).copied()
-            };
-            let mac = after("lladdr").and_then(normalize_mac);
+            let mac = util::token_after(&tokens, "lladdr").and_then(normalize_mac);
             let state = tokens
                 .last()
                 .filter(|t| t.chars().all(|c| c.is_ascii_uppercase()))
@@ -360,7 +357,7 @@ fn gather_os() -> (Vec<ArpEntry>, String) {
             entries.push(ArpEntry {
                 ip: tokens[0].to_string(),
                 mac: mac.unwrap_or_else(|| "(incomplete)".to_string()),
-                iface: after("dev").unwrap_or("?").to_string(),
+                iface: util::token_after(&tokens, "dev").unwrap_or("?").to_string(),
                 state: state.to_lowercase(),
             });
         }
@@ -448,17 +445,14 @@ fn parse_bsd_arp(raw: &str) -> Vec<ArpEntry> {
             .iter()
             .find(|t| t.starts_with('(') && t.ends_with(')'))
             .map(|t| t.trim_matches(|c| c == '(' || c == ')').to_string());
-        let after = |key: &str| {
-            tokens.iter().position(|t| *t == key).and_then(|i| tokens.get(i + 1)).copied()
-        };
         let Some(ip) = ip else { continue };
-        let raw_mac = after("at").unwrap_or("(incomplete)");
+        let raw_mac = util::token_after(&tokens, "at").unwrap_or("(incomplete)");
         let mac = normalize_mac(raw_mac);
         entries.push(ArpEntry {
             ip,
             state: if mac.is_some() { "reachable" } else { "incomplete" }.to_string(),
             mac: mac.unwrap_or_else(|| "(incomplete)".to_string()),
-            iface: after("on").unwrap_or("?").to_string(),
+            iface: util::token_after(&tokens, "on").unwrap_or("?").to_string(),
         });
     }
     entries

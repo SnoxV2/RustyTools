@@ -89,8 +89,16 @@ impl RustyToolsApp {
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.arp_filter)
-                            .desired_width(ui.available_width() - 40.0)
-                            .hint_text("e.g. 192.168.1 or a4:2b"),
+                            .margin(crate::theme::TEXT_EDIT_MARGIN)
+                            // Room for the clear button; egui adds the margin
+                            // outside the desired width.
+                            .desired_width(
+                                ui.available_width() - 40.0 - crate::theme::TEXT_EDIT_MARGIN.sum().x,
+                            )
+                            .hint_text(
+                                egui::RichText::new("e.g. 192.168.1 or a4:2b")
+                                    .color(crate::theme::HINT),
+                            ),
                     );
                     if ui.button("✖").on_hover_text("Clear search").clicked() {
                         self.arp_filter.clear();
@@ -249,9 +257,11 @@ impl RustyToolsApp {
                                 }
                                 ui.label(&entry.iface);
                                 let state_color = match entry.state.as_str() {
-                                    "reachable" => crate::theme::OK,
                                     "incomplete" | "failed" => crate::theme::TEXT_MUTED,
-                                    _ => crate::theme::WARN,
+                                    // Linux neighbor states that need a recheck.
+                                    "stale" | "delay" | "probe" => crate::theme::WARN,
+                                    // reachable, permanent, Windows dynamic/static…
+                                    _ => crate::theme::OK,
                                 };
                                 ui.colored_label(state_color, &entry.state);
                                 ui.end_row();
@@ -264,6 +274,7 @@ impl RustyToolsApp {
                         |ui| {
                             ui.add(
                                 egui::TextEdit::multiline(&mut self.arp_raw.as_str())
+                                    .margin(crate::theme::TEXT_EDIT_MARGIN)
                                     .font(egui::TextStyle::Monospace)
                                     .desired_width(f32::INFINITY),
                             );

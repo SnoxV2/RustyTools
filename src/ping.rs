@@ -109,7 +109,7 @@ fn worker(
         let timestamp = util::now_str();
         let status = match result {
             Ok(rtt) => {
-                let jitter = prev_rtt.map(|p| if rtt > p { rtt - p } else { p - rtt });
+                let jitter = prev_rtt.map(|p| rtt.abs_diff(p));
                 prev_rtt = Some(rtt);
                 PingStatus::Ok { rtt, jitter }
             }
@@ -263,22 +263,47 @@ impl Backend {
         match result {
             // The API only reports whole milliseconds: use our own timer.
             Ok(_) => Ok(started.elapsed()),
-            // Unreachable replies are loss, as on Unix: the worker must keep
-            // probing so the target is seen again when it comes back.
-            Err(
-                winping::Error::Timeout
-                | winping::Error::HostUnreachable
-                | winping::Error::NetUnreachable
-                | winping::Error::TtlExpired,
-            ) => Err(PingErr::Timeout),
-            Err(e) => {
-                let msg = e.to_string();
-                if looks_like_timeout(&msg, started.elapsed(), timeout) {
-                    Err(PingErr::Timeout)
-                } else {
-                    Err(PingErr::Other(msg))
-                }
+            Err(e) => Err(classify_win_error(e, started.elapsed(), timeout)),
+        }
+    }
+}
+
+/// Loss or fatal error? Unreachable replies are loss, as on Unix: the worker
+/// must keep probing so the target is seen again when it comes back.
+#[cfg(windows)]
+fn classify_win_error(e: winping::Error, elapsed: Duration, timeout: Duration) -> PingErr {
+    match e {
+        winping::Error::Timeout
+        | winping::Error::HostUnreachable
+        | winping::Error::NetUnreachable
+        | winping::Error::TtlExpired => PingErr::Timeout,
+        e => {
+            let msg = e.to_string();
+            if looks_like_timeout(&msg, elapsed, timeout) {
+                PingErr::Timeout
+            } else {
+                PingErr::Other(msg)
             }
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreachable_is_loss_not_fatal() {
+        let quick = Duration::from_millis(5);
+        let timeout = Duration::from_secs(2);
+        for e in [winping::Error::HostUnreachable, winping::Error::NetUnreachable] {
+            assert!(matches!(classify_win_error(e, quick, timeout), PingErr::Timeout));
+        }
+        // A real failure stops the worker...
+        let fatal = classify_win_error(winping::Error::Other(1), quick, timeout);
+        assert!(matches!(fatal, PingErr::Other(_)));
+        // ...unless it came after the whole timeout, which is loss.
+        let late = classify_win_error(winping::Error::Other(1), timeout, timeout);
+        assert!(matches!(late, PingErr::Timeout));
     }
 }

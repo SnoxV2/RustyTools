@@ -168,12 +168,6 @@ fn gather_routes() -> (Vec<RouteEntry>, String) {
     }
 }
 
-/// Helper: the token right after `key` in a whitespace-split line.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn token_after<'a>(tokens: &'a [&'a str], key: &str) -> Option<&'a str> {
-    tokens.iter().position(|t| *t == key).and_then(|i| tokens.get(i + 1)).copied()
-}
-
 /// Parses `netstat -rn` (macOS / BSD; also the Linux fallback).
 /// Columns per section: Destination Gateway Flags Netif [Expire].
 #[cfg(unix)]
@@ -236,14 +230,14 @@ fn parse_routes_iproute(raw: &str) -> Vec<RouteEntry> {
         let t: Vec<&str> = line.split_whitespace().collect();
         let mut info = Vec::new();
         for key in ["proto", "scope", "metric", "src"] {
-            if let Some(v) = token_after(&t, key) {
+            if let Some(v) = util::token_after(&t, key) {
                 info.push(format!("{key} {v}"));
             }
         }
         out.push(RouteEntry {
             destination: t[0].to_string(),
-            gateway: token_after(&t, "via").unwrap_or("on-link").to_string(),
-            interface: token_after(&t, "dev").unwrap_or("?").to_string(),
+            gateway: util::token_after(&t, "via").unwrap_or("on-link").to_string(),
+            interface: util::token_after(&t, "dev").unwrap_or("?").to_string(),
             info: info.join(", "),
             is_ipv6: is_v6 || t[0].contains(':'),
         });

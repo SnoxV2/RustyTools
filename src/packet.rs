@@ -17,8 +17,11 @@ use socket2::{Domain, Protocol, Socket, Type};
 use crate::app::Event;
 use crate::util;
 
-/// Connect timeout (TCP) and how long a reply is awaited.
+/// How long a reply is awaited.
 const TIMEOUT: Duration = Duration::from_secs(2);
+/// TCP connect timeout. Windows retries after a refusal and only reports it
+/// after ~2 s, so a shorter limit would show a closed port as "timed out".
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Proto {
@@ -153,7 +156,7 @@ fn send_one(
             if bind_ip.is_some() {
                 sock.bind(&local.into()).map_err(bind_err)?;
             }
-            sock.connect_timeout(&dst.into(), TIMEOUT).map_err(|e| match e.kind() {
+            sock.connect_timeout(&dst.into(), CONNECT_TIMEOUT).map_err(|e| match e.kind() {
                 std::io::ErrorKind::ConnectionRefused => "connection refused (port closed)".to_string(),
                 std::io::ErrorKind::TimedOut => "connection timed out".to_string(),
                 _ => format!("connection failed: {e}"),
@@ -228,8 +231,9 @@ mod tests {
         let out = send_one(Proto::Tcp, tcp_addr, Some(source), b"hello").unwrap();
         assert!(out.contains("connected in") && out.contains("reply 5 byte(s)"), "{out}");
 
-        // Closed TCP port: an error, not a success.
+        // Closed TCP port: reported as refused, not as a timeout.
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        assert!(send_one(Proto::Tcp, closed, None, b"").is_err());
+        let err = send_one(Proto::Tcp, closed, None, b"").unwrap_err();
+        assert!(err.contains("refused"), "{err}");
     }
 }

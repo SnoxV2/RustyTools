@@ -31,6 +31,8 @@ pub enum Event {
     Arp(ArpEvent),
     /// One result line of the packet sender.
     Packet(String),
+    /// A freshly gathered network configuration report.
+    NetConfig(NetReport),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -124,8 +126,9 @@ fn source_selector(ui: &mut egui::Ui, id: &str, src: &mut SourceUi, ifaces: &[If
             ui.label("Source IP:");
             ui.add(
                 egui::TextEdit::singleline(&mut src.custom_ip)
+                    .margin(crate::theme::TEXT_EDIT_MARGIN)
                     .desired_width(160.0)
-                    .hint_text("192.168.1.10"),
+                    .hint_text(egui::RichText::new("192.168.1.10").color(crate::theme::HINT)),
             );
         });
     }
@@ -292,6 +295,7 @@ pub struct RustyToolsApp {
     net_message: Option<String>,
     net_auto: bool,
     net_last_refresh: Instant,
+    net_loading: bool,
 
     // Log deletion (two-step confirmation), shared by all tabs
     delete_confirm: Option<&'static str>,
@@ -373,6 +377,7 @@ impl RustyToolsApp {
             net_message: None,
             net_auto: false,
             net_last_refresh: Instant::now(),
+            net_loading: false,
             delete_confirm: None,
             logs_message: None,
             ifaces: gather_ifaces(),
@@ -429,6 +434,11 @@ impl RustyToolsApp {
                 Event::Dns(DnsEvent::Answer(answer)) => self.dns_results.push(answer),
                 Event::Dns(DnsEvent::Done) => self.dns_running = false,
                 Event::Packet(line) => push_capped(&mut self.packet_log, line, 2000),
+                Event::NetConfig(report) => {
+                    self.net_report = Some(report);
+                    self.net_loading = false;
+                    self.net_last_refresh = Instant::now();
+                }
                 Event::Arp(ArpEvent::Vendor { oui, vendor }) => {
                     self.arp_vendors.insert(oui, vendor);
                 }
@@ -452,8 +462,6 @@ impl RustyToolsApp {
         }
     }
 
-    /// "Delete log files" button with a two-step inline confirmation.
-    /// Deletes every file in the tab's log subfolder.
     /// Log action buttons added inline to the current row (no wrapping
     /// layout): open the tab's log subfolder, and delete its logs (two-step
     /// confirmation, disabled while a session is writing). The status message
@@ -596,12 +604,13 @@ impl eframe::App for RustyToolsApp {
             self.config_dirty = false;
         }
 
-        if self.ping_session.is_some()
-            || self.trace_session.is_some()
+        if self.ping_session.as_ref().is_some_and(|s| s.is_running())
+            || self.trace_session.as_ref().is_some_and(|s| s.is_running())
             || self.dns_running
             || self.arp_vendor_running
             || self.arp_scanning
             || self.packet_session.as_ref().is_some_and(|s| s.is_running())
+            || self.net_loading
         {
             ctx.request_repaint_after(Duration::from_millis(200));
         } else if self.arp_auto || self.net_auto {
@@ -628,8 +637,9 @@ fn push_capped(buf: &mut VecDeque<String>, line: String, cap: usize) {
     }
 }
 
-/// A multiline text box with a manually-drawn dim placeholder (egui's own
-/// hint color is too bright — see theme::HINT).
+/// A multiline text box with a dim placeholder. egui places the hint exactly
+/// where typed text goes; only its color is ours (the default one is too
+/// bright — see theme::HINT).
 fn multiline_input(
     ui: &mut egui::Ui,
     text: &mut String,
@@ -637,20 +647,14 @@ fn multiline_input(
     rows: usize,
     hint: &str,
 ) -> egui::Response {
-    let resp = ui.add_enabled(
+    ui.add_enabled(
         enabled,
-        egui::TextEdit::multiline(text).desired_rows(rows).desired_width(f32::INFINITY),
-    );
-    if text.is_empty() {
-        ui.painter_at(resp.rect).text(
-            resp.rect.left_top() + egui::vec2(6.0, 4.0),
-            egui::Align2::LEFT_TOP,
-            hint,
-            egui::FontId::proportional(14.0),
-            crate::theme::HINT,
-        );
-    }
-    resp
+        egui::TextEdit::multiline(text)
+            .margin(crate::theme::TEXT_EDIT_MARGIN)
+            .desired_rows(rows)
+            .desired_width(f32::INFINITY)
+            .hint_text(egui::RichText::new(hint).color(crate::theme::HINT)),
+    )
 }
 
 fn loss_color(loss: f64) -> egui::Color32 {
