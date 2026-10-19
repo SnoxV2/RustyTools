@@ -342,7 +342,7 @@ impl RustyToolsApp {
                             Points::new(PlotPoints::from(losses))
                                 .color(crate::theme::DANGER)
                                 .shape(MarkerShape::Cross)
-                                .radius(5.0)
+                                .radius(5.0_f32)
                                 .name("packet loss"),
                         );
                     }

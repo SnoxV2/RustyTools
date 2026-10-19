@@ -283,11 +283,11 @@ fn build_echo_request(is_v4: bool, ident: u16, seq: u16, payload_len: usize) -> 
 
 fn checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
+    let (pairs, rest) = data.as_chunks::<2>();
+    for pair in pairs {
+        sum += u32::from(u16::from_be_bytes(*pair));
     }
-    if let [b] = chunks.remainder() {
+    if let [b] = rest {
         sum += u32::from(*b) << 8;
     }
     while sum >> 16 != 0 {
@@ -330,6 +330,7 @@ mod tests {
         match pinger.ping(7, Duration::from_secs(2)) {
             Ok(_) => panic!("got a reply from TEST-NET-1: reply matching is broken"),
             Err(PingError::Timeout) => {}
+            Err(PingError::TooBig) => panic!("a default-size probe cannot be too big"),
             Err(PingError::Other(e)) => panic!("unexpected fatal error: {e}"),
         }
         assert!(started.elapsed() >= Duration::from_millis(500));

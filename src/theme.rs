@@ -77,7 +77,7 @@ fn visuals() -> egui::Visuals {
     v.override_text_color = Some(TEXT);
     v.panel_fill = BG_WINDOW;
     v.window_fill = BG_WINDOW;
-    v.window_stroke = egui::Stroke::new(1.0, BORDER);
+    v.window_stroke = egui::Stroke::new(1.0_f32, BORDER);
     v.extreme_bg_color = BG_INPUT;
     v.faint_bg_color = BG_SURFACE;
     v.hyperlink_color = ORANGE;
@@ -85,27 +85,27 @@ fn visuals() -> egui::Visuals {
 
     v.widgets.noninteractive.bg_fill = BG_SURFACE;
     v.widgets.noninteractive.weak_bg_fill = BG_SURFACE;
-    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT_MUTED);
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT_MUTED);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
 
     v.widgets.inactive.bg_fill = BG_WIDGET;
     v.widgets.inactive.weak_bg_fill = BG_WIDGET;
-    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT);
-    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
 
     v.widgets.hovered.bg_fill = BG_HOVER;
     v.widgets.hovered.weak_bg_fill = BG_HOVER;
-    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, TEXT);
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ORANGE);
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, ORANGE);
 
     v.widgets.active.bg_fill = ORANGE_PRESSED;
     v.widgets.active.weak_bg_fill = ORANGE_PRESSED;
-    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, TEXT);
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, ORANGE);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, ORANGE);
 
     // Selected selectable_value / text selection use the accent.
     v.selection.bg_fill = ORANGE.gamma_multiply(0.40);
-    v.selection.stroke = egui::Stroke::new(1.0, ORANGE);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, ORANGE);
 
     for w in [
         &mut v.widgets.noninteractive,
