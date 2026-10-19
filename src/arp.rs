@@ -368,6 +368,29 @@ fn gather_os() -> (Vec<ArpEntry>, String) {
     }
 }
 
+/// "? (192.168.1.1) at a4:2b:b0:11:22:33 on en0 ifscope [ethernet]"
+#[cfg(unix)]
+fn parse_bsd_arp(raw: &str) -> Vec<ArpEntry> {
+    let mut entries = Vec::new();
+    for line in raw.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let ip = tokens
+            .iter()
+            .find(|t| t.starts_with('(') && t.ends_with(')'))
+            .map(|t| t.trim_matches(|c| c == '(' || c == ')').to_string());
+        let Some(ip) = ip else { continue };
+        let raw_mac = util::token_after(&tokens, "at").unwrap_or("(incomplete)");
+        let mac = normalize_mac(raw_mac);
+        entries.push(ArpEntry {
+            ip,
+            state: if mac.is_some() { "reachable" } else { "incomplete" }.to_string(),
+            mac: mac.unwrap_or_else(|| "(incomplete)".to_string()),
+            iface: util::token_after(&tokens, "on").unwrap_or("?").to_string(),
+        });
+    }
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,27 +456,4 @@ mod tests {
             .expect("Cisco OUI must be present");
         assert!(entry.company_name.to_lowercase().contains("cisco"), "{}", entry.company_name);
     }
-}
-
-/// "? (192.168.1.1) at a4:2b:b0:11:22:33 on en0 ifscope [ethernet]"
-#[cfg(unix)]
-fn parse_bsd_arp(raw: &str) -> Vec<ArpEntry> {
-    let mut entries = Vec::new();
-    for line in raw.lines() {
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        let ip = tokens
-            .iter()
-            .find(|t| t.starts_with('(') && t.ends_with(')'))
-            .map(|t| t.trim_matches(|c| c == '(' || c == ')').to_string());
-        let Some(ip) = ip else { continue };
-        let raw_mac = util::token_after(&tokens, "at").unwrap_or("(incomplete)");
-        let mac = normalize_mac(raw_mac);
-        entries.push(ArpEntry {
-            ip,
-            state: if mac.is_some() { "reachable" } else { "incomplete" }.to_string(),
-            mac: mac.unwrap_or_else(|| "(incomplete)".to_string()),
-            iface: util::token_after(&tokens, "on").unwrap_or("?").to_string(),
-        });
-    }
-    entries
 }
