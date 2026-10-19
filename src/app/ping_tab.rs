@@ -46,6 +46,14 @@ impl RustyToolsApp {
                     ev.timestamp, ev.target, ev.seq
                 )
             }
+            PingStatus::TooBig => {
+                state.stats.record_too_big();
+                state.samples.push_back((x, None));
+                format!(
+                    "[{}] {:<24} seq={:<5} TOO BIG (larger than the path MTU, fragmentation needed)",
+                    ev.timestamp, ev.target, ev.seq
+                )
+            }
             PingStatus::Error(msg) => {
                 if ev.seq > 0 {
                     state.stats.sent += 1;
@@ -88,6 +96,10 @@ impl RustyToolsApp {
             targets,
             Duration::from_secs_f32(self.config.ping_interval_s.max(0.1)),
             Duration::from_secs_f32(self.config.ping_timeout_s.max(0.1)),
+            ping::EchoOptions {
+                size: self.config.ping_size,
+                dont_fragment: self.config.ping_dont_fragment,
+            },
             source,
             &self.config.log_dir,
             self.tx.clone(),
@@ -152,7 +164,39 @@ impl RustyToolsApp {
                     self.config_dirty = true;
                 }
                 ui.end_row();
+                ui.label("Packet size (bytes):");
+                if ui
+                    .add_enabled(
+                        !running,
+                        // 65500: the largest ICMP payload Windows accepts.
+                        egui::DragValue::new(&mut self.config.ping_size).range(0..=65500),
+                    )
+                    .on_hover_text("ICMP payload size, like ping -l (Windows) or ping -s (Unix)")
+                    .changed()
+                {
+                    self.config_dirty = true;
+                }
+                ui.end_row();
             });
+            if ui
+                .add_enabled(
+                    !running,
+                    egui::Checkbox::new(
+                        &mut self.config.ping_dont_fragment,
+                        "Don't fragment (path MTU test)",
+                    ),
+                )
+                .changed()
+            {
+                self.config_dirty = true;
+            }
+            if self.config.ping_dont_fragment {
+                // IPv4 header (20) + ICMP header (8) on top of the payload.
+                ui.weak(format!(
+                    "IPv4 packet: {} bytes. A 1500-byte MTU allows a payload of 1472.",
+                    u32::from(self.config.ping_size) + 28
+                ));
+            }
             self.advanced_source_ui(ui, "ping_source", Tab::Ping, !running);
             ui.add_space(10.0);
 

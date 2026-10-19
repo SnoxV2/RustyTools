@@ -20,13 +20,17 @@ application (egui), cross-platform: **Windows, macOS, Linux**.
 ### 📡 Continuous ping
 - Ping multiple targets simultaneously (IP or FQDN, one per line)
 - Configurable interval and timeout (typed fields, persisted)
+- **Packet size** and **Don't Fragment** flag to test the path MTU: a packet
+  larger than the path MTU is reported as `TOO_BIG` instead of being
+  fragmented (payload + 28 = IPv4 packet size, so 1472 fits a 1500 MTU)
 - **PingPlotter-style latency graph** as the main view, with one colored line
   per target and red markers on packet loss
 - Live statistics: sent, received, loss (%), last/min/avg/max RTT, jitter
 - One timestamped CSV log file per target:
   `logs/ping/ping_<date>_<target>.csv` with
   `timestamp;target;ip;seq;status;rtt_ms;jitter_ms`
-  (status: `OK`, `TIMEOUT` on packet loss, or `ERROR: …`)
+  (status: `OK`, `TIMEOUT` on packet loss, `TOO_BIG` when Don't Fragment
+  is set and the packet exceeds the path MTU, or `ERROR: …`)
 
 Jitter is the variation between two consecutive RTTs; the table shows the
 session average.
@@ -37,6 +41,10 @@ session average.
   each hop row shows loss %, sent, last/avg/best/worst latency and jitter
 - Configurable hop limit (max hops), probe interval and probe timeout
 - Optional reverse DNS on hops
+- **ICMP rate limiting detection**: many routers limit the ICMP replies they
+  send, which shows as loss on that hop only. Loss that does not carry on to
+  the following hops is greyed out and marked "rate-limited?"; real loss shows
+  on every hop up to the destination
 - Multiple targets in parallel
 - Logs per target: `logs/traceroute/discovery_<date>_<target>.log` (raw path
   discovery) and `logs/traceroute/mtr_<date>_<target>.csv` (every probe)

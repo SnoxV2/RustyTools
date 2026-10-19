@@ -14,7 +14,24 @@ use crate::util;
 pub enum PingStatus {
     Ok { rtt: Duration, jitter: Option<Duration> },
     Timeout,
+    /// Don't Fragment was set and the packet is larger than the path MTU.
+    TooBig,
     Error(String),
+}
+
+/// Shape of the echo requests: payload size (like `ping -l` / `ping -s`) and
+/// the Don't Fragment flag, which together test the path MTU.
+#[derive(Clone, Copy)]
+pub struct EchoOptions {
+    pub size: u16,
+    pub dont_fragment: bool,
+}
+
+impl Default for EchoOptions {
+    fn default() -> Self {
+        // 32 bytes, like the Windows ping command.
+        EchoOptions { size: 32, dont_fragment: false }
+    }
 }
 
 pub struct PingEvent {
@@ -48,6 +65,7 @@ pub fn start(
     targets: Vec<String>,
     interval: Duration,
     timeout: Duration,
+    echo: EchoOptions,
     source: crate::util::SourceConfig,
     log_dir: &str,
     tx: Sender<Event>,
@@ -70,7 +88,7 @@ pub fn start(
         let tx = tx.clone();
         let source = source.clone();
         handles.push(std::thread::spawn(move || {
-            worker(target, interval, timeout, source, file, stop, tx);
+            worker(target, interval, timeout, Backend::new(source).with_echo(echo), file, stop, tx);
         }));
     }
 
@@ -82,7 +100,7 @@ fn worker(
     target: String,
     interval: Duration,
     timeout: Duration,
-    source: crate::util::SourceConfig,
+    backend: Backend,
     mut file: File,
     stop: Arc<AtomicBool>,
     tx: Sender<Event>,
@@ -105,7 +123,7 @@ fn worker(
     };
 
     let mut prev_rtt: Option<Duration> = None;
-    probe_loop(ip, interval, timeout, source, &stop, |seq, at, result| {
+    probe_loop(ip, interval, timeout, backend, &stop, |seq, at, result| {
         let timestamp = util::now_str();
         let status = match result {
             Ok(rtt) => {
@@ -114,6 +132,7 @@ fn worker(
                 PingStatus::Ok { rtt, jitter }
             }
             Err(PingErr::Timeout) => PingStatus::Timeout,
+            Err(PingErr::TooBig) => PingStatus::TooBig,
             Err(PingErr::Other(msg)) => PingStatus::Error(msg),
         };
 
@@ -126,6 +145,7 @@ fn worker(
                     .unwrap_or_default()
             ),
             PingStatus::Timeout => format!("{timestamp};{target};{ip};{seq};TIMEOUT;;"),
+            PingStatus::TooBig => format!("{timestamp};{target};{ip};{seq};TOO_BIG;;"),
             PingStatus::Error(msg) => {
                 format!("{timestamp};{target};{ip};{seq};ERROR: {};;", msg.replace(';', ","))
             }
@@ -152,11 +172,10 @@ pub(crate) fn probe_loop(
     ip: IpAddr,
     interval: Duration,
     timeout: Duration,
-    source: crate::util::SourceConfig,
+    mut backend: Backend,
     stop: &AtomicBool,
     mut on_result: impl FnMut(u64, Instant, Result<Duration, PingErr>),
 ) {
-    let mut backend = Backend::new(source);
     let mut seq: u64 = 0;
 
     while !stop.load(Ordering::SeqCst) {
@@ -182,19 +201,27 @@ pub(crate) fn probe_loop(
 
 pub(crate) enum PingErr {
     Timeout,
+    /// Larger than the path MTU with Don't Fragment set: a result, not a failure.
+    TooBig,
     Other(String),
 }
 
 #[cfg(unix)]
 pub(crate) struct Backend {
     source: crate::util::SourceConfig,
+    echo: EchoOptions,
     pinger: Option<(IpAddr, crate::icmp::Pinger)>,
 }
 
 #[cfg(unix)]
 impl Backend {
     pub(crate) fn new(source: crate::util::SourceConfig) -> Self {
-        Backend { source, pinger: None }
+        Backend { source, echo: EchoOptions::default(), pinger: None }
+    }
+
+    pub(crate) fn with_echo(mut self, echo: EchoOptions) -> Self {
+        self.echo = echo;
+        self
     }
 
     pub(crate) fn ping(
@@ -204,12 +231,14 @@ impl Backend {
         seq: u16,
     ) -> Result<Duration, PingErr> {
         if self.pinger.as_ref().is_none_or(|(cached, _)| *cached != ip) {
-            let pinger = crate::icmp::Pinger::new(ip, &self.source).map_err(PingErr::Other)?;
+            let pinger =
+                crate::icmp::Pinger::new(ip, &self.source, self.echo).map_err(PingErr::Other)?;
             self.pinger = Some((ip, pinger));
         }
         match self.pinger.as_ref().unwrap().1.ping(seq, timeout) {
             Ok(rtt) => Ok(rtt),
             Err(crate::icmp::PingError::Timeout) => Err(PingErr::Timeout),
+            Err(crate::icmp::PingError::TooBig) => Err(PingErr::TooBig),
             Err(crate::icmp::PingError::Other(msg)) => Err(PingErr::Other(msg)),
         }
     }
@@ -228,13 +257,19 @@ fn looks_like_timeout(msg: &str, elapsed: Duration, timeout: Duration) -> bool {
 #[cfg(windows)]
 pub(crate) struct Backend {
     source: crate::util::SourceConfig,
+    echo: EchoOptions,
     pinger: Option<winping::Pinger>,
 }
 
 #[cfg(windows)]
 impl Backend {
     pub(crate) fn new(source: crate::util::SourceConfig) -> Self {
-        Backend { source, pinger: winping::Pinger::new().ok() }
+        Backend { source, echo: EchoOptions::default(), pinger: winping::Pinger::new().ok() }
+    }
+
+    pub(crate) fn with_echo(mut self, echo: EchoOptions) -> Self {
+        self.echo = echo;
+        self
     }
 
     pub(crate) fn ping(
@@ -247,9 +282,10 @@ impl Backend {
             return Err(PingErr::Other("ICMP initialization failed (IcmpCreateFile)".into()));
         };
         pinger.set_timeout(timeout.as_millis().max(1) as u32);
+        pinger.set_df(self.echo.dont_fragment);
         let bind_ip = self.source.bind_ip_for(&ip).map_err(PingErr::Other)?;
         let started = Instant::now();
-        let mut buffer = winping::Buffer::new();
+        let mut buffer = winping::Buffer::with_data(vec![b'R'; usize::from(self.echo.size)]);
         // IcmpSendEcho2Ex (send*_from) handles the optional source address.
         let result = match (bind_ip, ip) {
             (Some(std::net::IpAddr::V4(src)), std::net::IpAddr::V4(dst)) => {
@@ -277,6 +313,7 @@ fn classify_win_error(e: winping::Error, elapsed: Duration, timeout: Duration) -
         | winping::Error::HostUnreachable
         | winping::Error::NetUnreachable
         | winping::Error::TtlExpired => PingErr::Timeout,
+        winping::Error::NeedsFragmented => PingErr::TooBig,
         e => {
             let msg = e.to_string();
             if looks_like_timeout(&msg, elapsed, timeout) {
@@ -299,6 +336,9 @@ mod tests {
         for e in [winping::Error::HostUnreachable, winping::Error::NetUnreachable] {
             assert!(matches!(classify_win_error(e, quick, timeout), PingErr::Timeout));
         }
+        // Too big for the path MTU with Don't Fragment: its own result.
+        let big = classify_win_error(winping::Error::NeedsFragmented, quick, timeout);
+        assert!(matches!(big, PingErr::TooBig));
         // A real failure stops the worker...
         let fatal = classify_win_error(winping::Error::Other(1), quick, timeout);
         assert!(matches!(fatal, PingErr::Other(_)));

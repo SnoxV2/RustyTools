@@ -3067,6 +3067,7 @@ dependencies = [
  "egui_plot",
  "gethostname 0.5.0",
  "hickory-resolver",
+ "libc",
  "mac_oui",
  "netdev",
  "rfd",

@@ -192,6 +192,11 @@ impl Stats {
         self.last_status = "TIMEOUT".to_string();
     }
 
+    fn record_too_big(&mut self) {
+        self.sent += 1;
+        self.last_status = "TOO BIG".to_string();
+    }
+
     fn record_error(&mut self, msg: &str) {
         self.last_status = format!("ERROR: {msg}");
     }
@@ -670,7 +675,7 @@ fn loss_color(loss: f64) -> egui::Color32 {
 fn status_label(ui: &mut egui::Ui, status: &str) {
     if status.starts_with("ERROR") {
         ui.colored_label(crate::theme::DANGER, status);
-    } else if status == "TIMEOUT" {
+    } else if status == "TIMEOUT" || status == "TOO BIG" {
         ui.colored_label(crate::theme::WARN, status);
     } else {
         ui.label(status);

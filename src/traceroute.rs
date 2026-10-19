@@ -270,11 +270,13 @@ fn hop_worker(
     stop: Arc<AtomicBool>,
     tx: Sender<Event>,
 ) {
-    crate::ping::probe_loop(ip, interval, timeout, source, &stop, |seq, _at, result| {
+    let backend = crate::ping::Backend::new(source);
+    crate::ping::probe_loop(ip, interval, timeout, backend, &stop, |seq, _at, result| {
         let timestamp = util::now_str();
         let status = match result {
             Ok(rtt) => ProbeStatus::Ok { rtt },
-            Err(PingErr::Timeout) => ProbeStatus::Timeout,
+            // Hop probes use the default size without Don't Fragment.
+            Err(PingErr::Timeout | PingErr::TooBig) => ProbeStatus::Timeout,
             Err(PingErr::Other(msg)) => ProbeStatus::Error(msg),
         };
 

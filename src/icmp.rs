@@ -20,11 +20,13 @@ pub enum PingError {
     /// for ICMP "destination unreachable" and OS-level unreachable errors,
     /// which are loss conditions, not fatal errors.
     Timeout,
+    /// Don't Fragment set and the packet exceeds the path MTU (local
+    /// EMSGSIZE, or ICMP "fragmentation needed" / ICMPv6 "packet too big").
+    TooBig,
     /// Fatal error (permissions, socket failure): the worker should stop.
     Other(String),
 }
 
-const PAYLOAD_LEN: usize = 24;
 const PAYLOAD_BYTE: u8 = 0x52; // 'R'
 
 static IDENT_COUNTER: AtomicU16 = AtomicU16::new(0);
@@ -33,6 +35,7 @@ pub struct Pinger {
     sock: Socket,
     ident: u16,
     is_v4: bool,
+    payload_len: usize,
     /// Linux ICMP datagram sockets: the kernel rewrites the identifier on the
     /// wire and already demultiplexes replies per socket, so the identifier
     /// of received packets cannot be compared with ours.
@@ -40,7 +43,11 @@ pub struct Pinger {
 }
 
 impl Pinger {
-    pub fn new(ip: IpAddr, source: &crate::util::SourceConfig) -> Result<Self, String> {
+    pub fn new(
+        ip: IpAddr,
+        source: &crate::util::SourceConfig,
+        echo: crate::ping::EchoOptions,
+    ) -> Result<Self, String> {
         let bind_ip = source.bind_ip_for(&ip)?;
         let domain = if ip.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
         let proto = if ip.is_ipv4() { Protocol::ICMPV4 } else { Protocol::ICMPV6 };
@@ -64,6 +71,12 @@ impl Pinger {
                 }
             },
         };
+
+        // shortcut: Don't Fragment is set for IPv4 only (routers never fragment
+        // IPv6 anyway), upgrade if hosts that fragment IPv6 locally matter.
+        if echo.dont_fragment && ip.is_ipv4() {
+            set_dont_fragment(&sock).map_err(|e| format!("cannot set Don't Fragment: {e}"))?;
+        }
 
         // Optional interface pinning (best effort: the source-IP bind below
         // already fixes the source addressing).
@@ -95,6 +108,7 @@ impl Pinger {
             sock,
             ident,
             is_v4: ip.is_ipv4(),
+            payload_len: usize::from(echo.size),
             kernel_ident: cfg!(target_os = "linux") && dgram,
         })
     }
@@ -102,7 +116,7 @@ impl Pinger {
     /// Sends one echo request and waits for the matching echo reply.
     /// Returns the precise RTT (send → validated reply).
     pub fn ping(&self, seq: u16, timeout: Duration) -> Result<Duration, PingError> {
-        let packet = build_echo_request(self.is_v4, self.ident, seq);
+        let packet = build_echo_request(self.is_v4, self.ident, seq, self.payload_len);
         let start = Instant::now();
         if let Err(e) = self.sock.send(&packet) {
             return Err(map_io_error(e, "send failed"));
@@ -123,6 +137,7 @@ impl Pinger {
                         Some(Reply::Echo) => return Ok(start.elapsed()),
                         // Unreachable = the probe was lost; count it as loss.
                         Some(Reply::Unreachable) => return Err(PingError::Timeout),
+                        Some(Reply::TooBig) => return Err(PingError::TooBig),
                         None => continue, // unrelated packet: keep waiting
                     }
                 }
@@ -153,7 +168,7 @@ impl Pinger {
         if icmp.len() < 8 {
             return None;
         }
-        let (echo_reply, unreachable) = if self.is_v4 { (0u8, [3u8, 11u8]) } else { (129, [1, 3]) };
+        let echo_reply = if self.is_v4 { 0u8 } else { 129 };
         let kind = icmp[0];
 
         if kind == echo_reply {
@@ -163,7 +178,14 @@ impl Pinger {
             return (ident_ok && rseq == seq).then_some(Reply::Echo);
         }
 
-        if unreachable.contains(&kind) {
+        // Errors about one of our probes: v4 3/4 = fragmentation needed,
+        // v6 2 = packet too big, other unreachable / time exceeded = loss.
+        let error = match (self.is_v4, kind, icmp[1]) {
+            (true, 3, 4) | (false, 2, _) => Some(Reply::TooBig),
+            (true, 3 | 11, _) | (false, 1 | 3, _) => Some(Reply::Unreachable),
+            _ => None,
+        };
+        if let Some(error) = error {
             // The error message embeds the original packet (IP header + ICMP
             // echo request): make sure it is really ours.
             let inner = icmp.get(8..)?;
@@ -183,8 +205,7 @@ impl Pinger {
             let ident = u16::from_be_bytes([inner_icmp[4], inner_icmp[5]]);
             let rseq = u16::from_be_bytes([inner_icmp[6], inner_icmp[7]]);
             let ident_ok = self.kernel_ident || ident == self.ident;
-            return (inner_icmp[0] == echo_request && ident_ok && rseq == seq)
-                .then_some(Reply::Unreachable);
+            return (inner_icmp[0] == echo_request && ident_ok && rseq == seq).then_some(error);
         }
         None
     }
@@ -193,11 +214,45 @@ impl Pinger {
 enum Reply {
     Echo,
     Unreachable,
+    TooBig,
+}
+
+/// Sets the IPv4 Don't Fragment flag on outgoing packets.
+fn set_dont_fragment(sock: &Socket) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    let (option, value) = (libc::IP_MTU_DISCOVER, libc::IP_PMTUDISC_DO);
+    // IP_DONTFRAG from <netinet/in.h>, not exported by libc for macOS.
+    #[cfg(target_os = "macos")]
+    let (option, value): (libc::c_int, libc::c_int) = (28, 1);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Err(std::io::Error::other("Don't Fragment is not supported on this system"));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let ret = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::IPPROTO_IP,
+                option,
+                &value as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
 }
 
 /// "Host/network unreachable" while sending is a loss condition (e.g. ARP
 /// failure on the local subnet), not a fatal socket error.
 fn map_io_error(e: std::io::Error, context: &str) -> PingError {
+    // Larger than the local interface MTU with Don't Fragment set.
+    if e.raw_os_error() == Some(libc::EMSGSIZE) {
+        return PingError::TooBig;
+    }
     // EHOSTDOWN(64/112), EHOSTUNREACH(65/113), ENETUNREACH(51/101),
     // ENETDOWN(50/100), ECONNREFUSED — macOS/Linux values.
     const LOSS_ERRNOS: [i32; 9] = [50, 51, 64, 65, 100, 101, 111, 112, 113];
@@ -208,14 +263,14 @@ fn map_io_error(e: std::io::Error, context: &str) -> PingError {
     }
 }
 
-fn build_echo_request(is_v4: bool, ident: u16, seq: u16) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(8 + PAYLOAD_LEN);
+fn build_echo_request(is_v4: bool, ident: u16, seq: u16, payload_len: usize) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(8 + payload_len);
     packet.push(if is_v4 { 8 } else { 128 }); // echo request
     packet.push(0); // code
     packet.extend_from_slice(&[0, 0]); // checksum, filled below
     packet.extend_from_slice(&ident.to_be_bytes());
     packet.extend_from_slice(&seq.to_be_bytes());
-    packet.extend(std::iter::repeat(PAYLOAD_BYTE).take(PAYLOAD_LEN));
+    packet.extend(std::iter::repeat_n(PAYLOAD_BYTE, payload_len));
     if is_v4 {
         // ICMPv6 checksums are computed by the kernel (pseudo-header needed);
         // for ICMPv4 we always provide it (the kernel recomputes it on Linux
@@ -251,7 +306,7 @@ mod tests {
 
     #[test]
     fn localhost_replies() {
-        let pinger = Pinger::new("127.0.0.1".parse().unwrap(), &default_source()).unwrap();
+        let pinger = Pinger::new("127.0.0.1".parse().unwrap(), &default_source(), Default::default()).unwrap();
         let rtt = pinger.ping(1, Duration::from_secs(2)).expect("localhost must reply");
         assert!(rtt < Duration::from_secs(1));
     }
@@ -262,7 +317,7 @@ mod tests {
             ip: Some("127.0.0.1".parse().unwrap()),
             iface: None,
         };
-        let pinger = Pinger::new("127.0.0.1".parse().unwrap(), &source).unwrap();
+        let pinger = Pinger::new("127.0.0.1".parse().unwrap(), &source, Default::default()).unwrap();
         pinger.ping(1, Duration::from_secs(2)).expect("bound localhost ping must reply");
     }
 
@@ -270,7 +325,7 @@ mod tests {
     fn dead_address_does_not_reply() {
         // 192.0.2.1 (TEST-NET-1, RFC 5737) must never answer: any Ok here
         // means we matched a packet that was not ours.
-        let pinger = Pinger::new("192.0.2.1".parse().unwrap(), &default_source()).unwrap();
+        let pinger = Pinger::new("192.0.2.1".parse().unwrap(), &default_source(), Default::default()).unwrap();
         let started = Instant::now();
         match pinger.ping(7, Duration::from_secs(2)) {
             Ok(_) => panic!("got a reply from TEST-NET-1: reply matching is broken"),
@@ -285,12 +340,12 @@ mod tests {
         // One responsive target and one dead target probed at the same time:
         // the dead one must stay dead even while replies are flowing in.
         let alive = std::thread::spawn(|| {
-            let pinger = Pinger::new("127.0.0.1".parse().unwrap(), &default_source()).unwrap();
+            let pinger = Pinger::new("127.0.0.1".parse().unwrap(), &default_source(), Default::default()).unwrap();
             for seq in 0..20 {
                 let _ = pinger.ping(seq, Duration::from_millis(200));
             }
         });
-        let pinger = Pinger::new("192.0.2.1".parse().unwrap(), &default_source()).unwrap();
+        let pinger = Pinger::new("192.0.2.1".parse().unwrap(), &default_source(), Default::default()).unwrap();
         for seq in 0..3 {
             assert!(
                 pinger.ping(seq, Duration::from_millis(700)).is_err(),

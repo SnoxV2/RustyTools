@@ -21,6 +21,9 @@ hickory-resolver = "0.24"
 mac_oui = { version = "0.4", features = ["with-db"] }
 socket2 = { version = "0.5", features = ["all"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 winping = "0.10"
 

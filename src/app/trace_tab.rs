@@ -238,7 +238,13 @@ impl RustyToolsApp {
                                     ui.strong(header);
                                 }
                                 ui.end_row();
-                                for row in &state.hops {
+                                let losses: Vec<Option<f64>> = state
+                                    .hops
+                                    .iter()
+                                    .map(|r| (r.info.ip.is_some() && r.stats.sent > 0).then(|| r.stats.loss_pct()))
+                                    .collect();
+                                let carried = carried_loss(&losses);
+                                for (row, carried) in state.hops.iter().zip(carried) {
                                     ui.label(row.info.hop.to_string());
                                     let host = match (&row.info.ip, &row.info.hostname) {
                                         (Some(ip), Some(name)) => format!("{name} ({ip})"),
@@ -252,7 +258,25 @@ impl RustyToolsApp {
                                     }
                                     if row.info.ip.is_some() {
                                         let loss = row.stats.loss_pct();
-                                        ui.colored_label(loss_color(loss), format!("{loss:.1} %"));
+                                        match carried {
+                                            // Loss that does not reach the next hops:
+                                            // the router limits its ICMP replies.
+                                            Some(c) if loss - c >= 1.0 => {
+                                                ui.colored_label(
+                                                    crate::theme::TEXT_MUTED,
+                                                    format!("{loss:.1} % (rate-limited?)"),
+                                                )
+                                                .on_hover_text(
+                                                    "This loss does not carry on to the next hops, so \
+                                                     traffic through this router is fine: it limits the \
+                                                     ICMP replies it sends. Real loss shows on every \
+                                                     hop after it, up to the destination.",
+                                                );
+                                            }
+                                            _ => {
+                                                ui.colored_label(loss_color(loss), format!("{loss:.1} %"));
+                                            }
+                                        }
                                         ui.label(row.stats.sent.to_string());
                                         ui.label(fmt_ms_opt(row.stats.last_rtt));
                                         ui.label(fmt_ms_opt(row.stats.avg_rtt()));
@@ -273,5 +297,41 @@ impl RustyToolsApp {
                 },
             );
         });
+    }
+}
+
+/// For each hop, the loss that carries on to every later hop (the minimum
+/// from this hop to the destination). Real loss at a router also hits all
+/// the hops behind it; loss seen only at one intermediate hop is that router
+/// rate-limiting its own ICMP replies. Silent hops (`None`) are skipped.
+fn carried_loss(losses: &[Option<f64>]) -> Vec<Option<f64>> {
+    let mut min_after = f64::INFINITY;
+    let mut out: Vec<Option<f64>> = losses
+        .iter()
+        .rev()
+        .map(|loss| {
+            loss.map(|l| {
+                min_after = min_after.min(l);
+                min_after
+            })
+        })
+        .collect();
+    out.reverse();
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loss_only_on_an_intermediate_hop_is_not_carried() {
+        // Hop 2 drops replies (rate limit), hop 3 silent, destination fine.
+        let carried = carried_loss(&[Some(0.0), Some(40.0), None, Some(0.0)]);
+        assert_eq!(carried, vec![Some(0.0), Some(0.0), None, Some(0.0)]);
+
+        // Real loss from hop 2 onwards carries to the destination.
+        let carried = carried_loss(&[Some(0.0), Some(12.0), Some(15.0), Some(10.0)]);
+        assert_eq!(carried, vec![Some(0.0), Some(10.0), Some(10.0), Some(10.0)]);
     }
 }
